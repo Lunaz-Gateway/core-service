@@ -1,0 +1,201 @@
+use crate::{now, St};
+use anyhow::Result;
+use hmac::{Hmac, Mac};
+use orchard::{
+    keys::{IncomingViewingKey, PreparedIncomingViewingKey, Scope},
+    note_encryption::{CompactAction, OrchardDomain},
+};
+use rusqlite::{params, OptionalExtension};
+use sha2::Sha256;
+use std::{sync::Arc, time::Duration};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use zcash_client_backend::proto::service::{
+    compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, ChainSpec, Empty,
+};
+use zcash_note_encryption::{try_compact_note_decryption, try_note_decryption};
+use zcash_primitives::transaction::Transaction;
+use zcash_protocol::consensus::{BlockHeight, BranchId};
+
+type Client = CompactTxStreamerClient<Channel>;
+
+struct Key {
+    merchant: i64,
+    ivk: IncomingViewingKey,
+    pivk: PreparedIncomingViewingKey,
+}
+
+fn keys(st: &St) -> Result<Vec<Key>> {
+    let db = st.db.lock().unwrap();
+    let mut q = db.prepare("SELECT id, ufvk FROM merchants")?;
+    let rows = q.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = vec![];
+    for r in rows {
+        let (merchant, ufvk) = r?;
+        let ivk = crate::api::parse_ufvk(&st.net, &ufvk)?.orchard().unwrap().to_ivk(Scope::External);
+        out.push(Key { merchant, pivk: PreparedIncomingViewingKey::new(&ivk), ivk });
+    }
+    Ok(out)
+}
+
+async fn connect(st: &St) -> Result<Client> {
+    let ch = Endpoint::from_shared(st.lwd.clone())?
+        .tls_config(ClientTlsConfig::new().with_webpki_roots())?
+        .connect()
+        .await?;
+    Ok(CompactTxStreamerClient::new(ch))
+}
+
+fn txid_hex(hash: &[u8]) -> String {
+    hex::encode(hash.iter().rev().copied().collect::<Vec<_>>())
+}
+
+pub async fn scanner(st: Arc<St>) {
+    loop {
+        expire(&st);
+        if let Err(e) = scan_once(&st).await {
+            tracing::warn!("scan: {e:#}");
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
+fn expire(st: &St) {
+    let ids: Vec<String> = (|| -> Result<_> {
+        let db = st.db.lock().unwrap();
+        let mut q = db.prepare("UPDATE invoices SET status='expired' WHERE status='pending' AND expires_at<?1 RETURNING id")?;
+        let ids = q.query_map([now()], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    })()
+    .unwrap_or_default();
+    for id in ids {
+        let _ = st.events.send((id, "expired".into()));
+    }
+}
+
+async fn scan_once(st: &St) -> Result<()> {
+    let mut c = connect(st).await?;
+    let tip = c.get_latest_block(ChainSpec {}).await?.into_inner().height;
+    let synced: Option<u64> = st.db.lock().unwrap().query_row("SELECT height FROM sync_state", [], |r| r.get(0)).optional()?;
+    let Some(mut h) = synced else {
+        st.db.lock().unwrap().execute("INSERT INTO sync_state(id,height) VALUES(1,?1)", [tip])?;
+        tracing::info!("first start, syncing from tip {tip}");
+        return Ok(());
+    };
+    while h < tip {
+        let end = (h + 500).min(tip);
+        let keys = keys(st)?;
+        let id = |height| Some(BlockId { height, hash: vec![] });
+        let mut s = c
+            .get_block_range(BlockRange { start: id(h + 1), end: id(end), pool_types: vec![] })
+            .await?
+            .into_inner();
+        while let Some(b) = s.message().await? {
+            for tx in &b.vtx {
+                let txid = txid_hex(&tx.txid);
+                for (i, a) in tx.actions.iter().enumerate() {
+                    let Ok(ca) = CompactAction::try_from(a) else { continue };
+                    for k in &keys {
+                        if let Some((note, addr)) = try_compact_note_decryption(&OrchardDomain::for_compact_action(&ca), &k.pivk, &ca) {
+                            if let Some(d) = k.ivk.diversifier_index(&addr) {
+                                record(st, k.merchant, u128::from(d), &txid, i, note.value().inner(), Some(b.height))?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        h = end;
+        st.db.lock().unwrap().execute("UPDATE sync_state SET height=?1", [h])?;
+        tracing::info!("scanned to {h} (tip {tip})");
+    }
+    Ok(())
+}
+
+pub async fn mempool(st: Arc<St>) {
+    loop {
+        if let Err(e) = mempool_once(&st).await {
+            tracing::warn!("mempool: {e:#}");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn mempool_once(st: &St) -> Result<()> {
+    let mut c = connect(st).await?;
+    let tip = c.get_latest_block(ChainSpec {}).await?.into_inner().height;
+    let branch = BranchId::for_height(&st.net, BlockHeight::from_u32(tip as u32 + 1));
+    let mut s = c.get_mempool_stream(Empty {}).await?.into_inner();
+    tracing::info!("mempool stream connected (tip {tip})");
+    while let Some(raw) = s.message().await? {
+        let Ok(tx) = Transaction::read(&raw.data[..], branch) else { continue };
+        let Some(bundle) = tx.orchard_bundle() else { continue };
+        let txid = tx.txid().to_string();
+        let keys = keys(st)?;
+        for (i, a) in bundle.actions().iter().enumerate() {
+            for k in &keys {
+                if let Some((note, addr, _)) = try_note_decryption(&OrchardDomain::for_action(a), &k.pivk, a) {
+                    if let Some(d) = k.ivk.diversifier_index(&addr) {
+                        record(st, k.merchant, u128::from(d), &txid, i, note.value().inner(), None)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ponytail: reorgs ignored; a mined payment is final once seen
+fn record(st: &St, merchant: i64, div: u128, txid: &str, idx: usize, value: u64, height: Option<u64>) -> Result<()> {
+    let Ok(div) = i64::try_from(div) else { return Ok(()) };
+    let db = st.db.lock().unwrap();
+    let Some((id, amount, old)) = db
+        .query_row(
+            "SELECT id, amount_zat, status FROM invoices WHERE merchant_id=?1 AND div_index=?2",
+            params![merchant, div],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+        )
+        .optional()?
+    else {
+        return Ok(());
+    };
+    db.execute(
+        "INSERT INTO payments(txid,action_idx,invoice_id,value_zat,height) VALUES(?1,?2,?3,?4,?5)
+         ON CONFLICT(txid,action_idx) DO UPDATE SET height=COALESCE(excluded.height, height)",
+        params![txid, idx, id, value, height],
+    )?;
+    let (received, mined): (i64, i64) = db.query_row(
+        "SELECT COALESCE(SUM(value_zat),0), COALESCE(SUM(CASE WHEN height IS NOT NULL THEN value_zat END),0) FROM payments WHERE invoice_id=?1",
+        [&id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let new = match old.as_str() {
+        "paid" => return Ok(()),
+        _ if mined >= amount => "paid",
+        "pending" => "detected",
+        _ => return Ok(()),
+    };
+    db.execute(
+        "UPDATE invoices SET status=?1, txid=?2, paid_at=CASE WHEN ?1='paid' THEN ?3 END WHERE id=?4",
+        params![new, txid, now(), id],
+    )?;
+    tracing::info!("invoice {id} -> {new} ({received}/{amount} zat)");
+    let _ = st.events.send((id.clone(), new.into()));
+    if new == "paid" {
+        let (url, secret): (Option<String>, String) =
+            db.query_row("SELECT webhook_url, webhook_secret FROM merchants WHERE id=?1", [merchant], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        if let Some(url) = url {
+            let body = serde_json::json!({"invoice_id": id, "status": new, "amount_zat": amount, "received_zat": received, "txid": txid}).to_string();
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
+            mac.update(body.as_bytes());
+            let sig = hex::encode(mac.finalize().into_bytes());
+            let http = st.http.clone();
+            tokio::spawn(async move {
+                let r = http.post(url).header("content-type", "application/json").header("X-Lunaz-Signature", sig).body(body).send().await;
+                if let Err(e) = r {
+                    tracing::warn!("webhook: {e}");
+                }
+            });
+        }
+    }
+    Ok(())
+}
