@@ -3,7 +3,7 @@ use anyhow::Result;
 use hmac::{Hmac, Mac};
 use orchard::{
     keys::{IncomingViewingKey, PreparedIncomingViewingKey, Scope},
-    note_encryption::{CompactAction, OrchardDomain},
+    note_encryption::{CompactAction, IronwoodDomain, OrchardDomain},
 };
 use rusqlite::{params, OptionalExtension};
 use sha2::Sha256;
@@ -17,6 +17,9 @@ use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 
 type Client = CompactTxStreamerClient<Channel>;
+
+// Ironwood (NU6.3) actions share the payments key space with Orchard, so offset their index.
+const IRONWOOD_IDX: usize = 1 << 20;
 
 struct Key {
     merchant: i64,
@@ -92,10 +95,17 @@ async fn scan_once(st: &St) -> Result<()> {
         while let Some(b) = s.message().await? {
             for tx in &b.vtx {
                 let txid = txid_hex(&tx.txid);
-                for (i, a) in tx.actions.iter().enumerate() {
+                let actions = tx.actions.iter().enumerate().map(|(i, a)| (i, a, false));
+                let ironwood = tx.ironwood_actions.iter().enumerate().map(|(i, a)| (i + IRONWOOD_IDX, a, true));
+                for (i, a, iw) in actions.chain(ironwood) {
                     let Ok(ca) = CompactAction::try_from(a) else { continue };
                     for k in &keys {
-                        if let Some((note, addr)) = try_compact_note_decryption(&OrchardDomain::for_compact_action(&ca), &k.pivk, &ca) {
+                        let dec = if iw {
+                            try_compact_note_decryption(&IronwoodDomain::for_compact_action(&ca), &k.pivk, &ca)
+                        } else {
+                            try_compact_note_decryption(&OrchardDomain::for_compact_action(&ca), &k.pivk, &ca)
+                        };
+                        if let Some((note, addr)) = dec {
                             if let Some(d) = k.ivk.diversifier_index(&addr) {
                                 record(st, k.merchant, u128::from(d), &txid, i, note.value().inner(), Some(b.height))?;
                             }
@@ -128,12 +138,18 @@ async fn mempool_once(st: &St) -> Result<()> {
     tracing::info!("mempool stream connected (tip {tip})");
     while let Some(raw) = s.message().await? {
         let Ok(tx) = Transaction::read(&raw.data[..], branch) else { continue };
-        let Some(bundle) = tx.orchard_bundle() else { continue };
         let txid = tx.txid().to_string();
         let keys = keys(st)?;
-        for (i, a) in bundle.actions().iter().enumerate() {
+        let actions = tx.orchard_bundle().into_iter().flat_map(|b| b.actions().iter().enumerate().map(|(i, a)| (i, a, false)));
+        let ironwood = tx.ironwood_bundle().into_iter().flat_map(|b| b.actions().iter().enumerate().map(|(i, a)| (i + IRONWOOD_IDX, a, true)));
+        for (i, a, iw) in actions.chain(ironwood) {
             for k in &keys {
-                if let Some((note, addr, _)) = try_note_decryption(&OrchardDomain::for_action(a), &k.pivk, a) {
+                let dec = if iw {
+                    try_note_decryption(&IronwoodDomain::for_action(a), &k.pivk, a)
+                } else {
+                    try_note_decryption(&OrchardDomain::for_action(a), &k.pivk, a)
+                };
+                if let Some((note, addr, _)) = dec {
                     if let Some(d) = k.ivk.diversifier_index(&addr) {
                         record(st, k.merchant, u128::from(d), &txid, i, note.value().inner(), None)?;
                     }
