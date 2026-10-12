@@ -50,8 +50,11 @@ pub fn parse_ufvk(net: &Network, s: &str) -> anyhow::Result<UnifiedFullViewingKe
     Ok(u)
 }
 
+// Invoice addresses live far above the low indices the merchant's own wallet hands out.
+pub const INDEX_BASE: u128 = 1 << 80;
+
 fn invoice_address(net: &Network, ufvk: &UnifiedFullViewingKey, n: u64) -> anyhow::Result<String> {
-    let idx = DiversifierIndex::try_from(n as u128)?;
+    let idx = DiversifierIndex::try_from(INDEX_BASE + n as u128)?;
     Ok(ufvk.address(idx, UnifiedAddressRequest::ORCHARD)?.encode(net))
 }
 
@@ -189,7 +192,8 @@ mod tests {
             _ => panic!(),
         };
         let ivk = ufvk.orchard().unwrap().to_ivk(Scope::External);
-        assert_eq!(u128::from(ivk.diversifier_index(ua.orchard().unwrap()).unwrap()), 5);
+        assert_eq!(u128::from(ivk.diversifier_index(ua.orchard().unwrap()).unwrap()), INDEX_BASE + 5);
+        assert_ne!(addr, ufvk.address(DiversifierIndex::from(5u32), UnifiedAddressRequest::ORCHARD).unwrap().encode(&net));
         assert!(zip321_uri(&addr, 1000, "lunaz:x").unwrap().starts_with("zcash:utest"));
     }
 }

@@ -146,7 +146,7 @@ async fn mempool_once(st: &St) -> Result<()> {
 
 // ponytail: reorgs ignored; a mined payment is final once seen
 fn record(st: &St, merchant: i64, div: u128, txid: &str, idx: usize, value: u64, height: Option<u64>) -> Result<()> {
-    let Ok(div) = i64::try_from(div) else { return Ok(()) };
+    let Some(Ok(div)) = div.checked_sub(crate::api::INDEX_BASE).map(i64::try_from) else { return Ok(()) };
     let db = st.db.lock().unwrap();
     let Some((id, amount, old)) = db
         .query_row(
