@@ -153,7 +153,7 @@ pub async fn get_invoice(State(st): State<Arc<St>>, Path(id): Path<String>) -> R
                 let (amount, address) = (r.get::<_, i64>(1)?, r.get::<_, String>(5)?);
                 let uri = zip321_uri(&address, amount as u64, &format!("lunaz:{id}")).ok();
                 Ok(json!({"id": id, "status": r.get::<_, String>(0)?, "amount_zat": amount, "address": address, "zip321_uri": uri,
-                    "expires_at": r.get::<_, i64>(2)?, "txid": r.get::<_, Option<String>>(3)?, "received_zat": r.get::<_, i64>(4)?}))
+                    "expires_at": r.get::<_, i64>(2)?, "txid": r.get::<_, Option<String>>(3)?, "received_zat": r.get::<_, i64>(4)?, "overpaid_zat": (r.get::<_, i64>(4)? - amount).max(0)}))
             },
         )
         .optional()?
@@ -189,7 +189,7 @@ async fn watch(st: Arc<St>, id: String, mut sock: WebSocket) -> anyhow::Result<(
             m["swap_status"] = sw.into();
         }
         sock.send(Message::text(m.to_string())).await?;
-        if matches!(cur.as_str(), "paid" | "expired" | "not_found") {
+        if matches!(cur.as_str(), "paid" | "underpaid" | "expired" | "not_found") {
             return Ok(());
         }
         cur = loop {

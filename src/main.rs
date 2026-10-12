@@ -122,6 +122,20 @@ mod tests {
     use zcash_keys::keys::UnifiedSpendingKey;
     use zip32::AccountId;
 
+    pub fn test_st() -> Arc<St> {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        Arc::new(St {
+            db: Mutex::new(db),
+            net: Network::TestNetwork,
+            lwd: String::new(),
+            events: broadcast::channel(16).0,
+            http: reqwest::Client::new(),
+            jwt: None,
+            assets: Mutex::new(None),
+        })
+    }
+
     #[test]
     fn password_roundtrip() {
         let h = account::hash_pw("hunter2hunter2").unwrap();
@@ -131,18 +145,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoked_key_blocks_invoices() {
-        let net = Network::TestNetwork;
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(SCHEMA).unwrap();
-        let st = Arc::new(St {
-            db: Mutex::new(db),
-            net,
-            lwd: String::new(),
-            events: broadcast::channel(4).0,
-            http: reqwest::Client::new(),
-            jwt: None,
-            assets: Mutex::new(None),
-        });
+        let (net, st) = (Network::TestNetwork, test_st());
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", l.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(l, app(st)).await.unwrap() });

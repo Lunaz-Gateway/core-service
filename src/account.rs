@@ -322,7 +322,7 @@ pub async fn list_invoices(State(st): S, h: HeaderMap, Query(q): Query<Lim>) -> 
     )?;
     let v = s
         .query_map(params![mid, q.limit.unwrap_or(50).clamp(1, 200)], |r| {
-            Ok(json!({"id": r.get::<_, String>(0)?, "status": r.get::<_, String>(1)?, "amount_zat": r.get::<_, i64>(2)?, "received_zat": r.get::<_, i64>(3)?,
+            Ok(json!({"id": r.get::<_, String>(0)?, "status": r.get::<_, String>(1)?, "amount_zat": r.get::<_, i64>(2)?, "received_zat": r.get::<_, i64>(3)?, "overpaid_zat": (r.get::<_, i64>(3)? - r.get::<_, i64>(2)?).max(0),
                 "address": r.get::<_, String>(4)?, "txid": r.get::<_, Option<String>>(5)?, "created_at": r.get::<_, i64>(6)?,
                 "expires_at": r.get::<_, i64>(7)?, "paid_at": r.get::<_, Option<i64>>(8)?}))
         })?

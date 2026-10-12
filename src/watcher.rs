@@ -4,7 +4,7 @@ use orchard::{
     keys::{IncomingViewingKey, PreparedIncomingViewingKey, Scope},
     note_encryption::{CompactAction, IronwoodDomain, OrchardDomain},
 };
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::{sync::Arc, time::Duration};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use zcash_client_backend::proto::service::{
@@ -67,7 +67,8 @@ pub async fn scanner(st: Arc<St>) {
     }
 }
 
-fn expire(st: &St) {
+fn expire(st: &Arc<St>) {
+    sweep(st);
     let ids: Vec<String> = (|| -> Result<_> {
         let db = st.db.lock().unwrap();
         let mut q = db.prepare("UPDATE invoices SET status='expired' WHERE status='pending' AND expires_at<?1 RETURNING id")?;
@@ -77,6 +78,20 @@ fn expire(st: &St) {
     .unwrap_or_default();
     for id in ids {
         let _ = st.events.send((id, "expired".into()));
+    }
+}
+
+// Re-evaluates detected invoices: expiry turns them underpaid, or expired if never mined.
+fn sweep(st: &Arc<St>) {
+    let db = st.db.lock().unwrap();
+    let ids: Vec<String> = db
+        .prepare("SELECT id FROM invoices WHERE status='detected'")
+        .and_then(|mut q| q.query_map([], |r| r.get(0))?.collect())
+        .unwrap_or_default();
+    for id in ids {
+        if let Err(e) = transition(st, &db, &id, None) {
+            tracing::warn!("sweep {id}: {e:#}");
+        }
     }
 }
 
@@ -239,17 +254,11 @@ fn record(
         return Ok(());
     };
     let db = st.db.lock().unwrap();
-    let Some((id, amount, old)) = db
+    let Some(id) = db
         .query_row(
-            "SELECT id, amount_zat, status FROM invoices WHERE merchant_id=?1 AND div_index=?2",
+            "SELECT id FROM invoices WHERE merchant_id=?1 AND div_index=?2",
             params![merchant, div],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            },
+            |r| r.get::<_, String>(0),
         )
         .optional()?
     else {
@@ -260,25 +269,55 @@ fn record(
          ON CONFLICT(txid,action_idx) DO UPDATE SET height=COALESCE(excluded.height, height)",
         params![txid, idx, id, value, height],
     )?;
+    transition(st, &db, &id, Some(txid))
+}
+
+/// Next invoice status given what was received (mempool + mined) and mined only; None = unchanged.
+fn next_status(
+    old: &str,
+    amount: i64,
+    received: i64,
+    mined: i64,
+    expires: i64,
+    now: i64,
+) -> Option<&'static str> {
+    match old {
+        "paid" => None,
+        _ if mined >= amount => Some("paid"), // also tops up an underpaid or expired invoice
+        "underpaid" => None,
+        _ if mined > 0 && now > expires => Some("underpaid"),
+        "pending" if received > 0 => Some("detected"),
+        // mempool-only payment that never confirmed: assume the tx was dropped
+        "detected" if mined == 0 && now > expires + DROPPED_AFTER => Some("expired"),
+        _ => None,
+    }
+}
+
+const DROPPED_AFTER: i64 = 3600;
+
+fn transition(st: &Arc<St>, db: &Connection, id: &str, txid: Option<&str>) -> Result<()> {
+    let (amount, old, expires): (i64, String, i64) = db.query_row(
+        "SELECT amount_zat, status, expires_at FROM invoices WHERE id=?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
     let (received, mined): (i64, i64) = db.query_row(
         "SELECT COALESCE(SUM(value_zat),0), COALESCE(SUM(CASE WHEN height IS NOT NULL THEN value_zat END),0) FROM payments WHERE invoice_id=?1",
-        [&id],
+        [id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    let new = match old.as_str() {
-        "paid" => return Ok(()),
-        _ if mined >= amount => "paid",
-        "pending" => "detected",
-        _ => return Ok(()),
+    let Some(new) = next_status(&old, amount, received, mined, expires, now()) else {
+        return Ok(());
     };
     db.execute(
-        "UPDATE invoices SET status=?1, txid=?2, paid_at=CASE WHEN ?1='paid' THEN ?3 END WHERE id=?4",
+        "UPDATE invoices SET status=?1, txid=COALESCE(?2, txid, (SELECT txid FROM payments WHERE invoice_id=?4 ORDER BY height IS NULL, height DESC LIMIT 1)),
+         paid_at=CASE WHEN ?1='paid' THEN ?3 ELSE paid_at END WHERE id=?4",
         params![new, txid, now(), id],
     )?;
     tracing::info!("invoice {id} -> {new} ({received}/{amount} zat)");
-    let _ = st.events.send((id.clone(), new.into()));
+    let _ = st.events.send((id.into(), new.into()));
     if let Some(t) = hook_type(new) {
-        crate::hook::notify(st, &db, &id, t)?;
+        crate::hook::notify(st, db, id, t)?;
     }
     Ok(())
 }
@@ -286,6 +325,145 @@ fn record(
 fn hook_type(status: &str) -> Option<&'static str> {
     match status {
         "paid" => Some("invoice.paid"),
+        "underpaid" => Some("invoice.underpaid"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{routing::post, Router};
+
+    #[test]
+    fn status_transitions() {
+        let n = next_status;
+        // (old, amount, received, mined, expires, now)
+        assert_eq!(n("pending", 100, 100, 0, 1000, 500), Some("detected"));
+        assert_eq!(n("pending", 100, 0, 0, 1000, 500), None);
+        assert_eq!(n("detected", 100, 100, 100, 1000, 500), Some("paid"));
+        assert_eq!(n("detected", 100, 107, 107, 1000, 500), Some("paid")); // overpaid
+        assert_eq!(n("detected", 100, 60, 60, 1000, 500), None); // partial, can still top up
+        assert_eq!(n("detected", 100, 60, 60, 1000, 1001), Some("underpaid"));
+        assert_eq!(n("underpaid", 100, 60, 60, 1000, 2000), None);
+        assert_eq!(n("underpaid", 100, 100, 100, 1000, 2000), Some("paid")); // late top-up
+        assert_eq!(n("expired", 100, 100, 100, 1000, 2000), Some("paid"));
+        assert_eq!(n("paid", 100, 200, 200, 1000, 2000), None);
+        // mempool only: expired only an hour after expiry
+        assert_eq!(n("detected", 100, 100, 0, 1000, 1000 + DROPPED_AFTER), None);
+        assert_eq!(
+            n("detected", 100, 100, 0, 1000, 1001 + DROPPED_AFTER),
+            Some("expired")
+        );
+    }
+
+    fn setup(st: &St, url: &str, amount: i64, expires: i64) {
+        let db = st.db.lock().unwrap();
+        db.execute("INSERT INTO merchants(id,email,password_hash,name,webhook_url,webhook_secret) VALUES(1,'a@b.co','x','n',?1,'s')", [url]).unwrap();
+        db.execute("INSERT INTO invoices(id,merchant_id,div_index,address,amount_zat,status,created_at,expires_at) VALUES('inv',1,0,'addr',?1,'pending',0,?2)", params![amount, expires]).unwrap();
+    }
+
+    fn status(st: &St) -> String {
+        let db = st.db.lock().unwrap();
+        db.query_row("SELECT status FROM invoices WHERE id='inv'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    // Receiver that collects webhook bodies.
+    async fn receiver() -> (String, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        let got = Arc::new(std::sync::Mutex::new(vec![]));
+        let g = got.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |b: String| async move {
+                g.lock().unwrap().push(serde_json::from_str(&b).unwrap());
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (url, got)
+    }
+
+    async fn wait(got: &std::sync::Mutex<Vec<serde_json::Value>>, n: usize) {
+        for _ in 0..50 {
+            if got.lock().unwrap().len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    const D: u128 = crate::api::INDEX_BASE;
+
+    #[tokio::test]
+    async fn overpaid_and_topup_sum() {
+        let st = crate::tests::test_st();
+        let (url, got) = receiver().await;
+        setup(&st, &url, 100_000, now() + 900);
+        record(&st, 1, D, "t1", 0, 40_000, None).unwrap();
+        assert_eq!(status(&st), "detected");
+        record(&st, 1, D, "t1", 0, 40_000, Some(5)).unwrap(); // mined
+        assert_eq!(status(&st), "detected"); // 40k < 100k, still open for a top-up
+        record(&st, 1, D, "t2", 0, 67_000, Some(6)).unwrap(); // second payment adds up
+        assert_eq!(status(&st), "paid");
+        wait(&got, 1).await;
+        let g = got.lock().unwrap();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0]["type"], "invoice.paid");
+        assert_eq!(
+            (g[0]["received_zat"].as_i64(), g[0]["overpaid_zat"].as_i64()),
+            (Some(107_000), Some(7_000))
+        );
+        assert_eq!(g[0]["txid"], "t2");
+    }
+
+    #[tokio::test]
+    async fn underpaid_on_expiry_then_topup() {
+        let st = crate::tests::test_st();
+        let (url, got) = receiver().await;
+        setup(&st, &url, 100_000, now() + 900);
+        record(&st, 1, D, "t1", 0, 60_000, Some(5)).unwrap();
+        sweep(&st);
+        assert_eq!(status(&st), "detected");
+        st.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE invoices SET expires_at=?1", [now() - 1])
+            .unwrap();
+        sweep(&st);
+        assert_eq!(status(&st), "underpaid");
+        wait(&got, 1).await;
+        {
+            let g = got.lock().unwrap();
+            assert_eq!(g[0]["type"], "invoice.underpaid");
+            assert_eq!(
+                (g[0]["status"].as_str(), g[0]["overpaid_zat"].as_i64()),
+                (Some("underpaid"), Some(0))
+            );
+        }
+        sweep(&st); // final: no second webhook
+        record(&st, 1, D, "t2", 0, 40_000, Some(9)).unwrap();
+        assert_eq!(status(&st), "paid");
+    }
+
+    #[tokio::test]
+    async fn mempool_only_expires() {
+        let st = crate::tests::test_st();
+        setup(&st, "", 100_000, now() - 7200);
+        st.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE invoices SET status='detected'", [])
+            .unwrap();
+        st.db
+            .lock()
+            .unwrap()
+            .execute("INSERT INTO payments VALUES('t1',0,'inv',100000,NULL)", [])
+            .unwrap();
+        sweep(&st);
+        assert_eq!(status(&st), "expired");
     }
 }
