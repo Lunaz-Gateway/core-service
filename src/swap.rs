@@ -212,8 +212,8 @@ pub fn swap_json(db: &Connection, invoice: &str) -> Option<Value> {
 }
 
 pub fn webhook_json(db: &Connection, invoice: &str) -> Value {
-    db.query_row("SELECT symbol, blockchain, amount_in_formatted FROM swaps WHERE invoice_id=?1", [invoice], |r| {
-        Ok(json!({"asset": r.get::<_, String>(0)?, "blockchain": r.get::<_, String>(1)?, "amount_in_formatted": r.get::<_, String>(2)?}))
+    db.query_row("SELECT symbol, blockchain, amount_in_formatted, status FROM swaps WHERE invoice_id=?1", [invoice], |r| {
+        Ok(json!({"asset": r.get::<_, String>(0)?, "blockchain": r.get::<_, String>(1)?, "amount_in_formatted": r.get::<_, String>(2)?, "status": r.get::<_, String>(3)?}))
     })
     .unwrap_or(Value::Null)
 }
@@ -227,7 +227,7 @@ pub async fn poller(st: Arc<St>) {
     }
 }
 
-async fn poll_once(st: &St) -> anyhow::Result<()> {
+async fn poll_once(st: &Arc<St>) -> anyhow::Result<()> {
     type Row = (String, String, String, Option<String>, String);
     let rows: Vec<Row> = {
         let db = st.db.lock().unwrap();
@@ -266,6 +266,16 @@ async fn poll_once(st: &St) -> anyhow::Result<()> {
             })?
         };
         tracing::info!("swap {sid} {old} -> {new}");
+        // REFUNDED/FAILED are final, so they fire once; the invoice stays pending for a retry
+        let typ = match new {
+            "REFUNDED" => Some("swap.refunded"),
+            "FAILED" => Some("swap.failed"),
+            "INCOMPLETE_DEPOSIT" => Some("swap.incomplete_deposit"),
+            _ => None,
+        };
+        if let Some(t) = typ {
+            crate::hook::notify(st, &st.db.lock().unwrap(), &inv, t)?;
+        }
         let _ = st.events.send((inv, inv_status));
     }
     Ok(())
