@@ -29,6 +29,11 @@ impl<E: Into<anyhow::Error>> From<E> for AppErr {
         AppErr(StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
     }
 }
+impl AppErr {
+    pub fn new(c: StatusCode, m: String) -> Self {
+        AppErr(c, m)
+    }
+}
 pub fn bad(c: StatusCode, m: &str) -> AppErr {
     AppErr(c, m.into())
 }
@@ -110,10 +115,8 @@ fn status_of(st: &St, id: &str) -> rusqlite::Result<Option<String>> {
 }
 
 pub async fn get_invoice(State(st): State<Arc<St>>, Path(id): Path<String>) -> R {
-    let v = st
-        .db
-        .lock()
-        .unwrap()
+    let db = st.db.lock().unwrap();
+    let mut v = db
         .query_row(
             "SELECT status, amount_zat, expires_at, txid, (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id)
              FROM invoices WHERE id=?1",
@@ -125,6 +128,7 @@ pub async fn get_invoice(State(st): State<Arc<St>>, Path(id): Path<String>) -> R
         )
         .optional()?
         .ok_or_else(|| bad(StatusCode::NOT_FOUND, "no such invoice"))?;
+    v["swap"] = crate::swap::swap_json(&db, &id).unwrap_or(Value::Null);
     Ok(Json(v))
 }
 
@@ -138,7 +142,12 @@ async fn watch(st: Arc<St>, id: String, mut sock: WebSocket) -> anyhow::Result<(
     let mut rx = st.events.subscribe(); // subscribe before reading so no change is missed
     let mut cur = status_of(&st, &id)?.unwrap_or_else(|| "not_found".into());
     loop {
-        sock.send(Message::text(json!({"status": cur}).to_string())).await?;
+        let sw: Option<String> = st.db.lock().unwrap().query_row("SELECT status FROM swaps WHERE invoice_id=?1", [&id], |r| r.get(0)).optional()?;
+        let mut m = json!({"status": cur});
+        if let Some(sw) = sw {
+            m["swap_status"] = sw.into();
+        }
+        sock.send(Message::text(m.to_string())).await?;
         if matches!(cur.as_str(), "paid" | "expired" | "not_found") {
             return Ok(());
         }

@@ -1,5 +1,6 @@
 mod account;
 mod api;
+mod swap;
 mod watcher;
 
 use axum::{routing::{delete, get, post, put}, Router};
@@ -14,6 +15,8 @@ pub struct St {
     pub lwd: String,
     pub events: broadcast::Sender<(String, String)>,
     pub http: reqwest::Client,
+    pub jwt: Option<String>,
+    pub assets: Mutex<Option<(i64, Vec<serde_json::Value>)>>,
 }
 
 pub fn now() -> i64 {
@@ -35,6 +38,8 @@ pub fn app(st: Arc<St>) -> Router {
         .route("/v1/account/invoices", get(account::list_invoices))
         .route("/v1/invoices", post(api::create_invoice))
         .route("/v1/invoices/{id}", get(api::get_invoice))
+        .route("/v1/invoices/{id}/swap", post(swap::create_swap))
+        .route("/v1/swap/assets", get(swap::list_assets))
         .route("/v1/invoices/{id}/ws", get(api::invoice_ws))
         .with_state(st)
 }
@@ -50,7 +55,11 @@ CREATE TABLE IF NOT EXISTS invoices(id TEXT PRIMARY KEY, merchant_id INTEGER NOT
   expires_at INTEGER NOT NULL, paid_at INTEGER, txid TEXT, UNIQUE(merchant_id, div_index));
 CREATE TABLE IF NOT EXISTS payments(txid TEXT NOT NULL, action_idx INTEGER NOT NULL, invoice_id TEXT NOT NULL,
   value_zat INTEGER NOT NULL, height INTEGER, PRIMARY KEY(txid, action_idx));
-CREATE TABLE IF NOT EXISTS sync_state(id INTEGER PRIMARY KEY CHECK(id=1), height INTEGER NOT NULL);";
+CREATE TABLE IF NOT EXISTS sync_state(id INTEGER PRIMARY KEY CHECK(id=1), height INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS swaps(id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL, origin_asset TEXT NOT NULL, symbol TEXT NOT NULL, blockchain TEXT NOT NULL,
+  deposit_address TEXT NOT NULL, deposit_memo TEXT, amount_in TEXT NOT NULL, amount_in_formatted TEXT NOT NULL, amount_in_usd TEXT, refund_to TEXT NOT NULL,
+  deadline TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING_DEPOSIT', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS swaps_invoice ON swaps(invoice_id);";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -69,10 +78,13 @@ async fn main() -> anyhow::Result<()> {
         lwd: env("LUNAZ_LWD_URL").unwrap_or(default_lwd.into()),
         events: broadcast::channel(256).0,
         http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build()?,
+        jwt: env("LUNAZ_ONECLICK_JWT").filter(|j| !j.is_empty()),
+        assets: Mutex::new(None),
     });
 
     tokio::spawn(watcher::scanner(st.clone()));
     tokio::spawn(watcher::mempool(st.clone()));
+    tokio::spawn(swap::poller(st.clone()));
 
     let app = app(st);
     let bind = env("LUNAZ_BIND").unwrap_or("0.0.0.0:8080".into());
@@ -100,7 +112,7 @@ mod tests {
         let net = Network::TestNetwork;
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(SCHEMA).unwrap();
-        let st = Arc::new(St { db: Mutex::new(db), net, lwd: String::new(), events: broadcast::channel(4).0, http: reqwest::Client::new() });
+        let st = Arc::new(St { db: Mutex::new(db), net, lwd: String::new(), events: broadcast::channel(4).0, http: reqwest::Client::new(), jwt: None, assets: Mutex::new(None) });
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", l.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(l, app(st)).await.unwrap() });

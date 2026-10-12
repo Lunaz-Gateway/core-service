@@ -198,7 +198,7 @@ fn record(st: &St, merchant: i64, div: u128, txid: &str, idx: usize, value: u64,
         let (url, secret): (Option<String>, String) =
             db.query_row("SELECT webhook_url, webhook_secret FROM merchants WHERE id=?1", [merchant], |r| Ok((r.get(0)?, r.get(1)?)))?;
         if let Some(url) = url {
-            let body = serde_json::json!({"type": "invoice.paid", "invoice_id": id, "status": new, "amount_zat": amount, "received_zat": received, "txid": txid}).to_string();
+            let body = serde_json::json!({"type": "invoice.paid", "invoice_id": id, "status": new, "amount_zat": amount, "received_zat": received, "txid": txid, "swap": crate::swap::webhook_json(&db, &id)}).to_string();
             let http = st.http.clone();
             tokio::spawn(async move {
                 let r = crate::account::send_webhook(&http, &url, &secret, body).await;
