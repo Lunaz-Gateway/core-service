@@ -69,6 +69,12 @@ pub async fn scanner(st: Arc<St>) {
 
 fn expire(st: &Arc<St>) {
     sweep(st);
+    let _ = st
+        .db
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM sessions WHERE expires_at<?1", [now()]);
+    st.limits.purge(now());
     let ids: Vec<String> = (|| -> Result<_> {
         let db = st.db.lock().unwrap();
         let mut q = db.prepare("UPDATE invoices SET status='expired' WHERE status='pending' AND expires_at<?1 RETURNING id")?;

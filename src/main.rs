@@ -1,6 +1,7 @@
 mod account;
 mod api;
 mod hook;
+mod limit;
 mod swap;
 mod watcher;
 
@@ -21,6 +22,7 @@ pub struct St {
     pub http: reqwest::Client,
     pub jwt: Option<String>,
     pub assets: Mutex<Option<(i64, Vec<serde_json::Value>)>>,
+    pub limits: limit::Limiter,
 }
 
 pub fn now() -> i64 {
@@ -102,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
             .build()?,
         jwt: env("LUNAZ_ONECLICK_JWT").filter(|j| !j.is_empty()),
         assets: Mutex::new(None),
+        limits: Default::default(),
     });
 
     tokio::spawn(watcher::scanner(st.clone()));
@@ -111,7 +114,11 @@ async fn main() -> anyhow::Result<()> {
     let app = app(st);
     let bind = env("LUNAZ_BIND").unwrap_or("0.0.0.0:8080".into());
     tracing::info!("listening on {bind}");
-    axum::serve(tokio::net::TcpListener::bind(bind).await?, app).await?;
+    axum::serve(
+        tokio::net::TcpListener::bind(bind).await?,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -133,6 +140,7 @@ mod tests {
             http: reqwest::Client::new(),
             jwt: None,
             assets: Mutex::new(None),
+            limits: Default::default(),
         })
     }
 
@@ -148,7 +156,14 @@ mod tests {
         let (net, st) = (Network::TestNetwork, test_st());
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", l.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(l, app(st)).await.unwrap() });
+        tokio::spawn(async move {
+            axum::serve(
+                l,
+                app(st).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
         let c = reqwest::Client::new();
         let call = |m: reqwest::Method, p: &str, tok: &str, b: Value| {
             let r = c.request(m, format!("{base}{p}")).bearer_auth(tok).json(&b);

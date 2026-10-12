@@ -5,7 +5,7 @@ use argon2::{
     Argon2,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -21,6 +21,22 @@ type S = State<Arc<St>>;
 type NoBody = Result<StatusCode, AppErr>;
 
 const SESSION_SECS: i64 = 30 * 86400;
+
+/// 10 attempts per email and 30 per client IP per 15 min on login/signup.
+// ponytail: behind a reverse proxy the IP is the proxy's, so the IP bucket is shared by everyone
+fn throttle(st: &St, ip: std::net::SocketAddr, email: &str) -> Result<(), AppErr> {
+    let t = now();
+    let email: String = email.chars().take(254).collect();
+    let l = &st.limits;
+    if l.hit(&format!("ip:{}", ip.ip()), 30, 900, t) && l.hit(&format!("email:{email}"), 10, 900, t)
+    {
+        return Ok(());
+    }
+    Err(bad(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many attempts, try again later",
+    ))
+}
 
 pub fn hash_pw(pw: &str) -> anyhow::Result<String> {
     Ok(Argon2::default()
@@ -67,9 +83,11 @@ pub struct Signup {
 
 pub async fn signup(
     State(st): S,
+    ConnectInfo(ip): ConnectInfo<std::net::SocketAddr>,
     Json(b): Json<Signup>,
 ) -> Result<(StatusCode, Json<Value>), AppErr> {
     let email = b.email.trim().to_lowercase();
+    throttle(&st, ip, &email)?;
     let err = |m| Err(bad(StatusCode::BAD_REQUEST, m));
     if !email.contains('@') || email.len() > 254 {
         return err("invalid email");
@@ -80,7 +98,11 @@ pub async fn signup(
     if b.name.trim().is_empty() {
         return err("name required");
     }
-    let (hash, secret) = (hash_pw(&b.password)?, rand_hex());
+    let pw = b.password.clone();
+    let (hash, secret) = (
+        tokio::task::spawn_blocking(move || hash_pw(&pw)).await??,
+        rand_hex(),
+    );
     let ins = st.db.lock().unwrap().execute(
         "INSERT INTO merchants(email,password_hash,name,webhook_secret) VALUES(?1,?2,?3,?4)",
         params![email, hash, b.name.trim(), secret],
@@ -103,7 +125,12 @@ pub struct Login {
     password: String,
 }
 
-pub async fn login(State(st): S, Json(b): Json<Login>) -> R {
+pub async fn login(
+    State(st): S,
+    ConnectInfo(ip): ConnectInfo<std::net::SocketAddr>,
+    Json(b): Json<Login>,
+) -> R {
+    throttle(&st, ip, &b.email.trim().to_lowercase())?;
     let row: Option<(i64, String)> = st
         .db
         .lock()
@@ -114,7 +141,8 @@ pub async fn login(State(st): S, Json(b): Json<Login>) -> R {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let ok = check_pw(&b.password, row.as_ref().map_or(DUMMY.as_str(), |r| &r.1));
+    let phc = row.as_ref().map_or(DUMMY.clone(), |r| r.1.clone());
+    let ok = tokio::task::spawn_blocking(move || check_pw(&b.password, &phc)).await?;
     match row {
         Some((mid, _)) if ok => Ok(Json(new_session(&st, mid)?)),
         _ => Err(bad(StatusCode::UNAUTHORIZED, "invalid email or password")),
