@@ -121,6 +121,13 @@ pub async fn create_swap(
         .optional()?
         .ok_or_else(|| bad(StatusCode::NOT_FOUND, "no such invoice"))?;
     let t = now();
+    // each call can create a 1Click quote, so cap them per invoice
+    if !st.limits.hit(&format!("swap:{id}"), 5, 600, t) {
+        return Err(bad(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many swap requests, try again later",
+        ));
+    }
     if status != "pending" || expires < t {
         return Err(bad(StatusCode::CONFLICT, "invoice is not pending"));
     }
