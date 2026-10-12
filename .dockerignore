@@ -1,0 +1,14 @@
+target/
+data/
+*.db
+*.db-*
+*.sqlite*
+.env*
+.git
+.gitignore
+*.log
+*.pem
+*.key
+*seed*
+*wallet*
+README.md
