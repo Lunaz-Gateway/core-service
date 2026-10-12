@@ -1,5 +1,6 @@
 mod account;
 mod api;
+mod hook;
 mod swap;
 mod watcher;
 
@@ -47,6 +48,10 @@ pub fn app(st: Arc<St>) -> Router {
         )
         .route("/v1/account/webhook/rotate", post(account::rotate_webhook))
         .route("/v1/account/webhook/test", post(account::test_webhook))
+        .route(
+            "/v1/account/webhook/deliveries",
+            get(account::list_deliveries),
+        )
         .route("/v1/account/invoices", get(account::list_invoices))
         .route("/v1/invoices", post(api::create_invoice))
         .route("/v1/invoices/{id}", get(api::get_invoice))
@@ -71,7 +76,10 @@ CREATE TABLE IF NOT EXISTS sync_state(id INTEGER PRIMARY KEY CHECK(id=1), height
 CREATE TABLE IF NOT EXISTS swaps(id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL, origin_asset TEXT NOT NULL, symbol TEXT NOT NULL, blockchain TEXT NOT NULL,
   deposit_address TEXT NOT NULL, deposit_memo TEXT, amount_in TEXT NOT NULL, amount_in_formatted TEXT NOT NULL, amount_in_usd TEXT, refund_to TEXT NOT NULL,
   deadline TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING_DEPOSIT', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS swaps_invoice ON swaps(invoice_id);";
+CREATE INDEX IF NOT EXISTS swaps_invoice ON swaps(invoice_id);
+CREATE TABLE IF NOT EXISTS webhook_deliveries(id INTEGER PRIMARY KEY, merchant_id INTEGER NOT NULL, invoice_id TEXT, type TEXT NOT NULL, url TEXT NOT NULL,
+  status_code INTEGER, error TEXT, attempt INTEGER NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS webhook_deliveries_merchant ON webhook_deliveries(merchant_id, id);";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

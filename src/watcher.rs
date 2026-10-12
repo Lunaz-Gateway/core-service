@@ -80,7 +80,7 @@ fn expire(st: &St) {
     }
 }
 
-async fn scan_once(st: &St) -> Result<()> {
+async fn scan_once(st: &Arc<St>) -> Result<()> {
     let mut c = connect(st).await?;
     let tip = c.get_latest_block(ChainSpec {}).await?.into_inner().height;
     let synced: Option<u64> = st
@@ -177,7 +177,7 @@ pub async fn mempool(st: Arc<St>) {
     }
 }
 
-async fn mempool_once(st: &St) -> Result<()> {
+async fn mempool_once(st: &Arc<St>) -> Result<()> {
     let mut c = connect(st).await?;
     let tip = c.get_latest_block(ChainSpec {}).await?.into_inner().height;
     let branch = BranchId::for_height(&st.net, BlockHeight::from_u32(tip as u32 + 1));
@@ -227,7 +227,7 @@ async fn mempool_once(st: &St) -> Result<()> {
 
 // ponytail: reorgs ignored; a mined payment is final once seen
 fn record(
-    st: &St,
+    st: &Arc<St>,
     merchant: i64,
     div: u128,
     txid: &str,
@@ -277,22 +277,15 @@ fn record(
     )?;
     tracing::info!("invoice {id} -> {new} ({received}/{amount} zat)");
     let _ = st.events.send((id.clone(), new.into()));
-    if new == "paid" {
-        let (url, secret): (Option<String>, String) = db.query_row(
-            "SELECT webhook_url, webhook_secret FROM merchants WHERE id=?1",
-            [merchant],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        if let Some(url) = url {
-            let body = serde_json::json!({"type": "invoice.paid", "invoice_id": id, "status": new, "amount_zat": amount, "received_zat": received, "txid": txid, "swap": crate::swap::webhook_json(&db, &id)}).to_string();
-            let http = st.http.clone();
-            tokio::spawn(async move {
-                let r = crate::account::send_webhook(&http, &url, &secret, body).await;
-                if let Err(e) = r {
-                    tracing::warn!("webhook: {e}");
-                }
-            });
-        }
+    if let Some(t) = hook_type(new) {
+        crate::hook::notify(st, &db, &id, t)?;
     }
     Ok(())
+}
+
+fn hook_type(status: &str) -> Option<&'static str> {
+    match status {
+        "paid" => Some("invoice.paid"),
+        _ => None,
+    }
 }

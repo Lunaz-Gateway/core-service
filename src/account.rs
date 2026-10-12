@@ -299,11 +299,13 @@ pub async fn test_webhook(State(st): S, h: HeaderMap) -> Result<(StatusCode, Jso
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let url = url.ok_or_else(|| bad(StatusCode::BAD_REQUEST, "webhook url not set"))?;
-    let body = json!({"type": "test", "invoice_id": null, "status": "paid", "amount_zat": 0, "received_zat": 0, "txid": null}).to_string();
-    Ok(match send_webhook(&st.http, &url, &secret, body).await {
-        Ok(s) => (StatusCode::OK, Json(json!({"status": s}))),
-        Err(e) => (StatusCode::OK, Json(json!({"error": e.to_string()}))),
-    })
+    let body = json!({"type": "test", "invoice_id": null, "status": "paid", "amount_zat": 0, "received_zat": 0, "overpaid_zat": 0, "txid": null, "swap": null}).to_string();
+    Ok(
+        match crate::hook::deliver(&st, mid, None, "test", (&url, &secret), body, false).await {
+            Ok(s) => (StatusCode::OK, Json(json!({"status": s}))),
+            Err(e) => (StatusCode::OK, Json(json!({"error": e.to_string()}))),
+        },
+    )
 }
 
 #[derive(Deserialize)]
@@ -323,6 +325,21 @@ pub async fn list_invoices(State(st): S, h: HeaderMap, Query(q): Query<Lim>) -> 
             Ok(json!({"id": r.get::<_, String>(0)?, "status": r.get::<_, String>(1)?, "amount_zat": r.get::<_, i64>(2)?, "received_zat": r.get::<_, i64>(3)?,
                 "address": r.get::<_, String>(4)?, "txid": r.get::<_, Option<String>>(5)?, "created_at": r.get::<_, i64>(6)?,
                 "expires_at": r.get::<_, i64>(7)?, "paid_at": r.get::<_, Option<i64>>(8)?}))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Json(v.into()))
+}
+
+pub async fn list_deliveries(State(st): S, h: HeaderMap, Query(q): Query<Lim>) -> R {
+    let mid = auth(&st, &h)?;
+    let db = st.db.lock().unwrap();
+    let mut s = db.prepare(
+        "SELECT id, invoice_id, type, url, status_code, error, attempt, created_at FROM webhook_deliveries WHERE merchant_id=?1 ORDER BY id DESC LIMIT ?2",
+    )?;
+    let v = s
+        .query_map(params![mid, q.limit.unwrap_or(50).clamp(1, 200)], |r| {
+            Ok(json!({"id": r.get::<_, i64>(0)?, "invoice_id": r.get::<_, Option<String>>(1)?, "type": r.get::<_, String>(2)?, "url": r.get::<_, String>(3)?,
+                "status_code": r.get::<_, Option<i64>>(4)?, "error": r.get::<_, Option<String>>(5)?, "attempt": r.get::<_, i64>(6)?, "created_at": r.get::<_, i64>(7)?}))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Json(v.into()))
