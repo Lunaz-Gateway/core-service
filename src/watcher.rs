@@ -1,12 +1,10 @@
 use crate::{now, St};
 use anyhow::Result;
-use hmac::{Hmac, Mac};
 use orchard::{
     keys::{IncomingViewingKey, PreparedIncomingViewingKey, Scope},
     note_encryption::{CompactAction, IronwoodDomain, OrchardDomain},
 };
 use rusqlite::{params, OptionalExtension};
-use sha2::Sha256;
 use std::{sync::Arc, time::Duration};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use zcash_client_backend::proto::service::{
@@ -29,7 +27,7 @@ struct Key {
 
 fn keys(st: &St) -> Result<Vec<Key>> {
     let db = st.db.lock().unwrap();
-    let mut q = db.prepare("SELECT id, ufvk FROM merchants")?;
+    let mut q = db.prepare("SELECT id, ufvk FROM merchants WHERE ufvk IS NOT NULL")?;
     let rows = q.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
     let mut out = vec![];
     for r in rows {
@@ -200,13 +198,10 @@ fn record(st: &St, merchant: i64, div: u128, txid: &str, idx: usize, value: u64,
         let (url, secret): (Option<String>, String) =
             db.query_row("SELECT webhook_url, webhook_secret FROM merchants WHERE id=?1", [merchant], |r| Ok((r.get(0)?, r.get(1)?)))?;
         if let Some(url) = url {
-            let body = serde_json::json!({"invoice_id": id, "status": new, "amount_zat": amount, "received_zat": received, "txid": txid}).to_string();
-            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
-            mac.update(body.as_bytes());
-            let sig = hex::encode(mac.finalize().into_bytes());
+            let body = serde_json::json!({"type": "invoice.paid", "invoice_id": id, "status": new, "amount_zat": amount, "received_zat": received, "txid": txid}).to_string();
             let http = st.http.clone();
             tokio::spawn(async move {
-                let r = http.post(url).header("content-type", "application/json").header("X-Lunaz-Signature", sig).body(body).send().await;
+                let r = crate::account::send_webhook(&http, &url, &secret, body).await;
                 if let Err(e) = r {
                     tracing::warn!("webhook: {e}");
                 }

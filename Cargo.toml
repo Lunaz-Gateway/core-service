@@ -28,6 +28,7 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1"
+argon2 = "0.5"
 
 [dev-dependencies]
 zcash_keys = { version = "0.16.1", features = ["orchard", "test-dependencies"] }

@@ -29,15 +29,15 @@ impl<E: Into<anyhow::Error>> From<E> for AppErr {
         AppErr(StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
     }
 }
-fn bad(c: StatusCode, m: &str) -> AppErr {
+pub fn bad(c: StatusCode, m: &str) -> AppErr {
     AppErr(c, m.into())
 }
-type R = Result<Json<Value>, AppErr>;
+pub type R = Result<Json<Value>, AppErr>;
 
-fn bearer(h: &HeaderMap) -> Option<&str> {
+pub fn bearer(h: &HeaderMap) -> Option<&str> {
     h.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ")
 }
-fn rand_hex() -> String {
+pub fn rand_hex() -> String {
     hex::encode(rand::random::<[u8; 32]>())
 }
 pub fn sha_hex(s: &str) -> String {
@@ -65,30 +65,6 @@ fn zip321_uri(address: &str, amount: u64, memo: &str) -> anyhow::Result<String> 
 }
 
 #[derive(Deserialize)]
-pub struct NewMerchant {
-    name: String,
-    ufvk: String,
-    webhook_url: Option<String>,
-}
-
-pub async fn create_merchant(State(st): State<Arc<St>>, h: HeaderMap, Json(b): Json<NewMerchant>) -> R {
-    if bearer(&h) != Some(&st.admin) {
-        return Err(bad(StatusCode::UNAUTHORIZED, "bad admin token"));
-    }
-    parse_ufvk(&st.net, &b.ufvk).map_err(|e| AppErr(StatusCode::BAD_REQUEST, e.to_string()))?;
-    let (key, secret) = (rand_hex(), rand_hex());
-    let id = {
-        let db = st.db.lock().unwrap();
-        db.execute(
-            "INSERT INTO merchants(name,ufvk,api_key_hash,webhook_url,webhook_secret) VALUES(?1,?2,?3,?4,?5)",
-            params![b.name, b.ufvk, sha_hex(&key), b.webhook_url, secret],
-        )?;
-        db.last_insert_rowid()
-    };
-    Ok(Json(json!({"id": id, "api_key": key, "webhook_secret": secret})))
-}
-
-#[derive(Deserialize)]
 pub struct NewInvoice {
     amount_zat: u64,
     expires_in_secs: Option<i64>,
@@ -107,14 +83,19 @@ pub async fn create_invoice(State(st): State<Arc<St>>, h: HeaderMap, Json(b): Js
     let (created, expires) = (now(), now() + ttl);
     let db = st.db.lock().unwrap();
     // Allocation and insert share one lock, so a failed insert cannot burn an index unnoticed.
-    let (mid, ufvk, idx): (i64, String, u64) = db
-        .query_row(
-            "UPDATE merchants SET next_index=next_index+1 WHERE api_key_hash=?1 RETURNING id, ufvk, next_index-1",
-            [sha_hex(key)],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
+    let kh = sha_hex(key);
+    let mid: i64 = db
+        .query_row("UPDATE api_keys SET last_used_at=?1 WHERE key_hash=?2 AND revoked_at IS NULL RETURNING merchant_id", params![now(), kh], |r| r.get(0))
         .optional()?
         .ok_or_else(|| bad(StatusCode::UNAUTHORIZED, "bad api key"))?;
+    let (ufvk, idx): (String, u64) = db
+        .query_row(
+            "UPDATE merchants SET next_index=next_index+1 WHERE id=?1 AND ufvk IS NOT NULL RETURNING ufvk, next_index-1",
+            [mid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| bad(StatusCode::BAD_REQUEST, "viewing key not set"))?;
     let address = invoice_address(&st.net, &parse_ufvk(&st.net, &ufvk)?, idx)?;
     let uri = zip321_uri(&address, b.amount_zat, &format!("lunaz:{id}"))?;
     db.execute(
