@@ -14,7 +14,7 @@ orchard = "0.15"
 zcash_note_encryption = "0.4.1"
 zip32 = "0.2"
 tonic = { version = "0.14.6", features = ["tls-ring", "tls-webpki-roots"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 axum = { version = "0.8", features = ["ws"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

@@ -36,6 +36,7 @@ pub fn now() -> i64 {
 
 pub fn app(st: Arc<St>) -> Router {
     Router::new()
+        .route("/healthz", get(|| async { "ok" }))
         .route("/v1/auth/signup", post(account::signup))
         .route("/v1/auth/login", post(account::login))
         .route("/v1/auth/logout", post(account::logout))
@@ -103,6 +104,18 @@ fn migrate(db: &Connection) -> rusqlite::Result<()> {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let env = |k: &str| std::env::var(k).ok();
+    // Hidden subcommand for container HEALTHCHECK (distroless has no curl).
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        let port = env("LUNAZ_BIND").unwrap_or("0.0.0.0:8080".into());
+        let port = port.rsplit(':').next().unwrap_or("8080").to_string();
+        let ok = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/healthz"))
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success());
+        std::process::exit(if ok { 0 } else { 1 });
+    }
     let (net, default_lwd) = match env("LUNAZ_NETWORK").as_deref().unwrap_or("test") {
         "main" => (Network::MainNetwork, "https://zec.rocks:443"),
         "test" => (Network::TestNetwork, "https://testnet.zec.rocks:443"),
@@ -136,8 +149,19 @@ async fn main() -> anyhow::Result<()> {
         tokio::net::TcpListener::bind(bind).await?,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown())
     .await?;
     Ok(())
+}
+
+/// Resolves on ctrl-c or SIGTERM (docker stop).
+async fn shutdown() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("sigterm handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
 }
 
 #[cfg(test)]
