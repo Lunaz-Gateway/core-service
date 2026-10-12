@@ -124,6 +124,16 @@ pub async fn create_swap(
     if status != "pending" || expires < t {
         return Err(bad(StatusCode::CONFLICT, "invoice is not pending"));
     }
+    // Replacing a swap abandons its deposit address, so only allow it before any deposit is seen.
+    let active: Option<String> = st.db.lock().unwrap()
+        .query_row("SELECT status FROM swaps WHERE invoice_id=?1 AND status NOT IN ('PENDING_DEPOSIT','REFUNDED','FAILED')", [&id], |r| r.get(0))
+        .optional()?;
+    if let Some(s) = active {
+        return Err(bad(
+            StatusCode::CONFLICT,
+            &format!("a swap is already in progress ({s})"),
+        ));
+    }
     let refund = b.refund_to.trim();
     if refund.is_empty() {
         return Err(bad(StatusCode::BAD_REQUEST, "refund_to required"));
