@@ -32,8 +32,15 @@ fn keys(st: &St) -> Result<Vec<Key>> {
     let mut out = vec![];
     for r in rows {
         let (merchant, ufvk) = r?;
-        let ivk = crate::api::parse_ufvk(&st.net, &ufvk)?.orchard().unwrap().to_ivk(Scope::External);
-        out.push(Key { merchant, pivk: PreparedIncomingViewingKey::new(&ivk), ivk });
+        let ivk = crate::api::parse_ufvk(&st.net, &ufvk)?
+            .orchard()
+            .unwrap()
+            .to_ivk(Scope::External);
+        out.push(Key {
+            merchant,
+            pivk: PreparedIncomingViewingKey::new(&ivk),
+            ivk,
+        });
     }
     Ok(out)
 }
@@ -76,36 +83,75 @@ fn expire(st: &St) {
 async fn scan_once(st: &St) -> Result<()> {
     let mut c = connect(st).await?;
     let tip = c.get_latest_block(ChainSpec {}).await?.into_inner().height;
-    let synced: Option<u64> = st.db.lock().unwrap().query_row("SELECT height FROM sync_state", [], |r| r.get(0)).optional()?;
+    let synced: Option<u64> = st
+        .db
+        .lock()
+        .unwrap()
+        .query_row("SELECT height FROM sync_state", [], |r| r.get(0))
+        .optional()?;
     let Some(mut h) = synced else {
-        st.db.lock().unwrap().execute("INSERT INTO sync_state(id,height) VALUES(1,?1)", [tip])?;
+        st.db
+            .lock()
+            .unwrap()
+            .execute("INSERT INTO sync_state(id,height) VALUES(1,?1)", [tip])?;
         tracing::info!("first start, syncing from tip {tip}");
         return Ok(());
     };
     while h < tip {
         let end = (h + 500).min(tip);
         let keys = keys(st)?;
-        let id = |height| Some(BlockId { height, hash: vec![] });
+        let id = |height| {
+            Some(BlockId {
+                height,
+                hash: vec![],
+            })
+        };
         let mut s = c
-            .get_block_range(BlockRange { start: id(h + 1), end: id(end), pool_types: vec![] })
+            .get_block_range(BlockRange {
+                start: id(h + 1),
+                end: id(end),
+                pool_types: vec![],
+            })
             .await?
             .into_inner();
         while let Some(b) = s.message().await? {
             for tx in &b.vtx {
                 let txid = txid_hex(&tx.txid);
                 let actions = tx.actions.iter().enumerate().map(|(i, a)| (i, a, false));
-                let ironwood = tx.ironwood_actions.iter().enumerate().map(|(i, a)| (i + IRONWOOD_IDX, a, true));
+                let ironwood = tx
+                    .ironwood_actions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| (i + IRONWOOD_IDX, a, true));
                 for (i, a, iw) in actions.chain(ironwood) {
-                    let Ok(ca) = CompactAction::try_from(a) else { continue };
+                    let Ok(ca) = CompactAction::try_from(a) else {
+                        continue;
+                    };
                     for k in &keys {
                         let dec = if iw {
-                            try_compact_note_decryption(&IronwoodDomain::for_compact_action(&ca), &k.pivk, &ca)
+                            try_compact_note_decryption(
+                                &IronwoodDomain::for_compact_action(&ca),
+                                &k.pivk,
+                                &ca,
+                            )
                         } else {
-                            try_compact_note_decryption(&OrchardDomain::for_compact_action(&ca), &k.pivk, &ca)
+                            try_compact_note_decryption(
+                                &OrchardDomain::for_compact_action(&ca),
+                                &k.pivk,
+                                &ca,
+                            )
                         };
                         if let Some((note, addr)) = dec {
                             if let Some(d) = k.ivk.diversifier_index(&addr) {
-                                record(st, k.merchant, u128::from(d), &txid, i, note.value().inner(), Some(b.height))?;
+                                record(
+                                    st,
+                                    k.merchant,
+                                    u128::from(d),
+                                    &txid,
+                                    i,
+                                    note.value().inner(),
+                                    Some(b.height),
+                                )?;
                             }
                         }
                     }
@@ -113,7 +159,10 @@ async fn scan_once(st: &St) -> Result<()> {
             }
         }
         h = end;
-        st.db.lock().unwrap().execute("UPDATE sync_state SET height=?1", [h])?;
+        st.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE sync_state SET height=?1", [h])?;
         tracing::info!("scanned to {h} (tip {tip})");
     }
     Ok(())
@@ -135,11 +184,21 @@ async fn mempool_once(st: &St) -> Result<()> {
     let mut s = c.get_mempool_stream(Empty {}).await?.into_inner();
     tracing::info!("mempool stream connected (tip {tip})");
     while let Some(raw) = s.message().await? {
-        let Ok(tx) = Transaction::read(&raw.data[..], branch) else { continue };
+        let Ok(tx) = Transaction::read(&raw.data[..], branch) else {
+            continue;
+        };
         let txid = tx.txid().to_string();
         let keys = keys(st)?;
-        let actions = tx.orchard_bundle().into_iter().flat_map(|b| b.actions().iter().enumerate().map(|(i, a)| (i, a, false)));
-        let ironwood = tx.ironwood_bundle().into_iter().flat_map(|b| b.actions().iter().enumerate().map(|(i, a)| (i + IRONWOOD_IDX, a, true)));
+        let actions = tx
+            .orchard_bundle()
+            .into_iter()
+            .flat_map(|b| b.actions().iter().enumerate().map(|(i, a)| (i, a, false)));
+        let ironwood = tx.ironwood_bundle().into_iter().flat_map(|b| {
+            b.actions()
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (i + IRONWOOD_IDX, a, true))
+        });
         for (i, a, iw) in actions.chain(ironwood) {
             for k in &keys {
                 let dec = if iw {
@@ -149,7 +208,15 @@ async fn mempool_once(st: &St) -> Result<()> {
                 };
                 if let Some((note, addr, _)) = dec {
                     if let Some(d) = k.ivk.diversifier_index(&addr) {
-                        record(st, k.merchant, u128::from(d), &txid, i, note.value().inner(), None)?;
+                        record(
+                            st,
+                            k.merchant,
+                            u128::from(d),
+                            &txid,
+                            i,
+                            note.value().inner(),
+                            None,
+                        )?;
                     }
                 }
             }
@@ -159,14 +226,30 @@ async fn mempool_once(st: &St) -> Result<()> {
 }
 
 // ponytail: reorgs ignored; a mined payment is final once seen
-fn record(st: &St, merchant: i64, div: u128, txid: &str, idx: usize, value: u64, height: Option<u64>) -> Result<()> {
-    let Some(Ok(div)) = div.checked_sub(crate::api::INDEX_BASE).map(i64::try_from) else { return Ok(()) };
+fn record(
+    st: &St,
+    merchant: i64,
+    div: u128,
+    txid: &str,
+    idx: usize,
+    value: u64,
+    height: Option<u64>,
+) -> Result<()> {
+    let Some(Ok(div)) = div.checked_sub(crate::api::INDEX_BASE).map(i64::try_from) else {
+        return Ok(());
+    };
     let db = st.db.lock().unwrap();
     let Some((id, amount, old)) = db
         .query_row(
             "SELECT id, amount_zat, status FROM invoices WHERE merchant_id=?1 AND div_index=?2",
             params![merchant, div],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()?
     else {
@@ -195,8 +278,11 @@ fn record(st: &St, merchant: i64, div: u128, txid: &str, idx: usize, value: u64,
     tracing::info!("invoice {id} -> {new} ({received}/{amount} zat)");
     let _ = st.events.send((id.clone(), new.into()));
     if new == "paid" {
-        let (url, secret): (Option<String>, String) =
-            db.query_row("SELECT webhook_url, webhook_secret FROM merchants WHERE id=?1", [merchant], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let (url, secret): (Option<String>, String) = db.query_row(
+            "SELECT webhook_url, webhook_secret FROM merchants WHERE id=?1",
+            [merchant],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         if let Some(url) = url {
             let body = serde_json::json!({"type": "invoice.paid", "invoice_id": id, "status": new, "amount_zat": amount, "received_zat": received, "txid": txid, "swap": crate::swap::webhook_json(&db, &id)}).to_string();
             let http = st.http.clone();

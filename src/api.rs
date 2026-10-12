@@ -1,6 +1,9 @@
 use crate::{now, St};
 use axum::{
-    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, State,
+    },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -40,7 +43,10 @@ pub fn bad(c: StatusCode, m: &str) -> AppErr {
 pub type R = Result<Json<Value>, AppErr>;
 
 pub fn bearer(h: &HeaderMap) -> Option<&str> {
-    h.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ")
+    h.get("authorization")?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
 }
 pub fn rand_hex() -> String {
     hex::encode(rand::random::<[u8; 32]>())
@@ -50,7 +56,8 @@ pub fn sha_hex(s: &str) -> String {
 }
 
 pub fn parse_ufvk(net: &Network, s: &str) -> anyhow::Result<UnifiedFullViewingKey> {
-    let u = UnifiedFullViewingKey::decode(net, s).map_err(|e| anyhow::anyhow!("invalid ufvk: {e}"))?;
+    let u =
+        UnifiedFullViewingKey::decode(net, s).map_err(|e| anyhow::anyhow!("invalid ufvk: {e}"))?;
     anyhow::ensure!(u.orchard().is_some(), "ufvk has no orchard component");
     Ok(u)
 }
@@ -60,12 +67,21 @@ pub const INDEX_BASE: u128 = 1 << 80;
 
 fn invoice_address(net: &Network, ufvk: &UnifiedFullViewingKey, n: u64) -> anyhow::Result<String> {
     let idx = DiversifierIndex::try_from(INDEX_BASE + n as u128)?;
-    Ok(ufvk.address(idx, UnifiedAddressRequest::ORCHARD)?.encode(net))
+    Ok(ufvk
+        .address(idx, UnifiedAddressRequest::ORCHARD)?
+        .encode(net))
 }
 
 fn zip321_uri(address: &str, amount: u64, memo: &str) -> anyhow::Result<String> {
     let addr: ZcashAddress = address.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let p = Payment::new(addr, Some(Zatoshis::from_u64(amount)?), Some(MemoBytes::from_bytes(memo.as_bytes())?), None, None, vec![])?;
+    let p = Payment::new(
+        addr,
+        Some(Zatoshis::from_u64(amount)?),
+        Some(MemoBytes::from_bytes(memo.as_bytes())?),
+        None,
+        None,
+        vec![],
+    )?;
     Ok(TransactionRequest::new(vec![p])?.to_uri())
 }
 
@@ -75,7 +91,11 @@ pub struct NewInvoice {
     expires_in_secs: Option<i64>,
 }
 
-pub async fn create_invoice(State(st): State<Arc<St>>, h: HeaderMap, Json(b): Json<NewInvoice>) -> R {
+pub async fn create_invoice(
+    State(st): State<Arc<St>>,
+    h: HeaderMap,
+    Json(b): Json<NewInvoice>,
+) -> R {
     let key = bearer(&h).ok_or_else(|| bad(StatusCode::UNAUTHORIZED, "missing api key"))?;
     if b.amount_zat == 0 || Zatoshis::from_u64(b.amount_zat).is_err() {
         return Err(bad(StatusCode::BAD_REQUEST, "invalid amount_zat"));
@@ -107,11 +127,19 @@ pub async fn create_invoice(State(st): State<Arc<St>>, h: HeaderMap, Json(b): Js
         "INSERT INTO invoices(id,merchant_id,div_index,address,amount_zat,status,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,'pending',?6,?7)",
         params![id, mid, idx, address, b.amount_zat, created, expires],
     )?;
-    Ok(Json(json!({"id": id, "address": address, "amount_zat": b.amount_zat, "zip321_uri": uri, "status": "pending", "expires_at": expires})))
+    Ok(Json(
+        json!({"id": id, "address": address, "amount_zat": b.amount_zat, "zip321_uri": uri, "status": "pending", "expires_at": expires}),
+    ))
 }
 
 fn status_of(st: &St, id: &str) -> rusqlite::Result<Option<String>> {
-    st.db.lock().unwrap().query_row("SELECT status FROM invoices WHERE id=?1", [id], |r| r.get(0)).optional()
+    st.db
+        .lock()
+        .unwrap()
+        .query_row("SELECT status FROM invoices WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()
 }
 
 pub async fn get_invoice(State(st): State<Arc<St>>, Path(id): Path<String>) -> R {
@@ -132,7 +160,11 @@ pub async fn get_invoice(State(st): State<Arc<St>>, Path(id): Path<String>) -> R
     Ok(Json(v))
 }
 
-pub async fn invoice_ws(State(st): State<Arc<St>>, Path(id): Path<String>, ws: WebSocketUpgrade) -> Response {
+pub async fn invoice_ws(
+    State(st): State<Arc<St>>,
+    Path(id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
     ws.on_upgrade(move |sock| async move {
         let _ = watch(st, id, sock).await;
     })
@@ -142,7 +174,14 @@ async fn watch(st: Arc<St>, id: String, mut sock: WebSocket) -> anyhow::Result<(
     let mut rx = st.events.subscribe(); // subscribe before reading so no change is missed
     let mut cur = status_of(&st, &id)?.unwrap_or_else(|| "not_found".into());
     loop {
-        let sw: Option<String> = st.db.lock().unwrap().query_row("SELECT status FROM swaps WHERE invoice_id=?1", [&id], |r| r.get(0)).optional()?;
+        let sw: Option<String> = st
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT status FROM swaps WHERE invoice_id=?1", [&id], |r| {
+                r.get(0)
+            })
+            .optional()?;
         let mut m = json!({"status": cur});
         if let Some(sw) = sw {
             m["swap_status"] = sw.into();
@@ -154,7 +193,9 @@ async fn watch(st: Arc<St>, id: String, mut sock: WebSocket) -> anyhow::Result<(
         cur = loop {
             match rx.recv().await {
                 Ok((i, s)) if i == id => break s,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break status_of(&st, &id)?.unwrap_or_default(),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    break status_of(&st, &id)?.unwrap_or_default()
+                }
                 Err(_) => return Ok(()),
                 _ => {}
             }
@@ -182,8 +223,18 @@ mod tests {
             _ => panic!(),
         };
         let ivk = ufvk.orchard().unwrap().to_ivk(Scope::External);
-        assert_eq!(u128::from(ivk.diversifier_index(ua.orchard().unwrap()).unwrap()), INDEX_BASE + 5);
-        assert_ne!(addr, ufvk.address(DiversifierIndex::from(5u32), UnifiedAddressRequest::ORCHARD).unwrap().encode(&net));
-        assert!(zip321_uri(&addr, 1000, "lunaz:x").unwrap().starts_with("zcash:utest"));
+        assert_eq!(
+            u128::from(ivk.diversifier_index(ua.orchard().unwrap()).unwrap()),
+            INDEX_BASE + 5
+        );
+        assert_ne!(
+            addr,
+            ufvk.address(DiversifierIndex::from(5u32), UnifiedAddressRequest::ORCHARD)
+                .unwrap()
+                .encode(&net)
+        );
+        assert!(zip321_uri(&addr, 1000, "lunaz:x")
+            .unwrap()
+            .starts_with("zcash:utest"));
     }
 }

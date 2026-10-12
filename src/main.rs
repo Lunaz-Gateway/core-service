@@ -3,7 +3,10 @@ mod api;
 mod swap;
 mod watcher;
 
-use axum::{routing::{delete, get, post, put}, Router};
+use axum::{
+    routing::{delete, get, post, put},
+    Router,
+};
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
@@ -20,7 +23,10 @@ pub struct St {
 }
 
 pub fn now() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 pub fn app(st: Arc<St>) -> Router {
@@ -30,9 +36,15 @@ pub fn app(st: Arc<St>) -> Router {
         .route("/v1/auth/logout", post(account::logout))
         .route("/v1/account", get(account::account))
         .route("/v1/account/ufvk", put(account::set_ufvk))
-        .route("/v1/account/api-keys", get(account::list_keys).post(account::create_key))
+        .route(
+            "/v1/account/api-keys",
+            get(account::list_keys).post(account::create_key),
+        )
         .route("/v1/account/api-keys/{id}", delete(account::revoke_key))
-        .route("/v1/account/webhook", get(account::get_webhook).put(account::set_webhook))
+        .route(
+            "/v1/account/webhook",
+            get(account::get_webhook).put(account::set_webhook),
+        )
         .route("/v1/account/webhook/rotate", post(account::rotate_webhook))
         .route("/v1/account/webhook/test", post(account::test_webhook))
         .route("/v1/account/invoices", get(account::list_invoices))
@@ -77,7 +89,9 @@ async fn main() -> anyhow::Result<()> {
         net,
         lwd: env("LUNAZ_LWD_URL").unwrap_or(default_lwd.into()),
         events: broadcast::channel(256).0,
-        http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build()?,
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?,
         jwt: env("LUNAZ_ONECLICK_JWT").filter(|j| !j.is_empty()),
         assets: Mutex::new(None),
     });
@@ -112,7 +126,15 @@ mod tests {
         let net = Network::TestNetwork;
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(SCHEMA).unwrap();
-        let st = Arc::new(St { db: Mutex::new(db), net, lwd: String::new(), events: broadcast::channel(4).0, http: reqwest::Client::new(), jwt: None, assets: Mutex::new(None) });
+        let st = Arc::new(St {
+            db: Mutex::new(db),
+            net,
+            lwd: String::new(),
+            events: broadcast::channel(4).0,
+            http: reqwest::Client::new(),
+            jwt: None,
+            assets: Mutex::new(None),
+        });
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", l.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(l, app(st)).await.unwrap() });
@@ -121,22 +143,73 @@ mod tests {
             let r = c.request(m, format!("{base}{p}")).bearer_auth(tok).json(&b);
             async move {
                 let r = r.send().await.unwrap();
-                (r.status().as_u16(), r.json::<Value>().await.unwrap_or_default())
+                (
+                    r.status().as_u16(),
+                    r.json::<Value>().await.unwrap_or_default(),
+                )
             }
         };
         let post = reqwest::Method::POST;
-        let (s, v) = call(post.clone(), "/v1/auth/signup", "", json!({"email": "A@b.co", "name": "n", "password": "password1"})).await;
+        let (s, v) = call(
+            post.clone(),
+            "/v1/auth/signup",
+            "",
+            json!({"email": "A@b.co", "name": "n", "password": "password1"}),
+        )
+        .await;
         assert_eq!(s, 201);
         let tok = v["token"].as_str().unwrap().to_string();
         let inv = json!({"amount_zat": 1000});
-        let (s, v) = call(post.clone(), "/v1/account/api-keys", &tok, json!({"name": "k"})).await;
+        let (s, v) = call(
+            post.clone(),
+            "/v1/account/api-keys",
+            &tok,
+            json!({"name": "k"}),
+        )
+        .await;
         assert_eq!(s, 201);
-        let (id, key) = (v["id"].as_i64().unwrap(), v["key"].as_str().unwrap().to_string());
-        assert_eq!(call(post.clone(), "/v1/invoices", &key, inv.clone()).await.0, 400); // no ufvk yet
-        let ufvk = UnifiedSpendingKey::from_seed(&net, &[7u8; 32], AccountId::ZERO).unwrap().to_unified_full_viewing_key().encode(&net);
-        assert_eq!(call(reqwest::Method::PUT, "/v1/account/ufvk", &tok, json!({"ufvk": ufvk})).await.0, 204);
-        assert_eq!(call(post.clone(), "/v1/invoices", &key, inv.clone()).await.0, 200);
-        assert_eq!(call(reqwest::Method::DELETE, &format!("/v1/account/api-keys/{id}"), &tok, json!({})).await.0, 204);
+        let (id, key) = (
+            v["id"].as_i64().unwrap(),
+            v["key"].as_str().unwrap().to_string(),
+        );
+        assert_eq!(
+            call(post.clone(), "/v1/invoices", &key, inv.clone())
+                .await
+                .0,
+            400
+        ); // no ufvk yet
+        let ufvk = UnifiedSpendingKey::from_seed(&net, &[7u8; 32], AccountId::ZERO)
+            .unwrap()
+            .to_unified_full_viewing_key()
+            .encode(&net);
+        assert_eq!(
+            call(
+                reqwest::Method::PUT,
+                "/v1/account/ufvk",
+                &tok,
+                json!({"ufvk": ufvk})
+            )
+            .await
+            .0,
+            204
+        );
+        assert_eq!(
+            call(post.clone(), "/v1/invoices", &key, inv.clone())
+                .await
+                .0,
+            200
+        );
+        assert_eq!(
+            call(
+                reqwest::Method::DELETE,
+                &format!("/v1/account/api-keys/{id}"),
+                &tok,
+                json!({})
+            )
+            .await
+            .0,
+            204
+        );
         assert_eq!(call(post, "/v1/invoices", &key, inv).await.0, 401);
     }
 }
