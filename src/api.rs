@@ -146,11 +146,13 @@ pub async fn get_invoice(State(st): State<Arc<St>>, Path(id): Path<String>) -> R
     let db = st.db.lock().unwrap();
     let mut v = db
         .query_row(
-            "SELECT status, amount_zat, expires_at, txid, (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id)
+            "SELECT status, amount_zat, expires_at, txid, (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id), address
              FROM invoices WHERE id=?1",
             [&id],
             |r| {
-                Ok(json!({"id": id, "status": r.get::<_, String>(0)?, "amount_zat": r.get::<_, i64>(1)?,
+                let (amount, address) = (r.get::<_, i64>(1)?, r.get::<_, String>(5)?);
+                let uri = zip321_uri(&address, amount as u64, &format!("lunaz:{id}")).ok();
+                Ok(json!({"id": id, "status": r.get::<_, String>(0)?, "amount_zat": amount, "address": address, "zip321_uri": uri,
                     "expires_at": r.get::<_, i64>(2)?, "txid": r.get::<_, Option<String>>(3)?, "received_zat": r.get::<_, i64>(4)?}))
             },
         )
