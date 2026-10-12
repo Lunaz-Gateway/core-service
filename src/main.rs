@@ -1,5 +1,6 @@
 mod account;
 mod api;
+mod export;
 mod hook;
 mod limit;
 mod swap;
@@ -56,6 +57,7 @@ pub fn app(st: Arc<St>) -> Router {
             get(account::list_deliveries),
         )
         .route("/v1/account/invoices", get(account::list_invoices))
+        .route("/v1/account/export.csv", get(export::export_csv))
         .route("/v1/invoices", post(api::create_invoice))
         .route("/v1/invoices/{id}", get(api::get_invoice))
         .route("/v1/invoices/{id}/swap", post(swap::create_swap))

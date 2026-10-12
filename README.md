@@ -23,6 +23,10 @@ Dashboard (JSON, errors `{"error": ...}`). Session token = `Authorization: Beare
 - `GET /v1/account/webhook` -> `{url, secret}`; `PUT` `{url|null}` -> 204; `POST .../rotate` -> `{secret}`; `POST .../test` -> `{status}` or `{error}` (single attempt)
 - `GET /v1/account/webhook/deliveries?limit=50` (max 200) -> newest first `[{id, invoice_id, type, url, status_code, error, attempt, created_at}]`, one row per attempt
 - `GET /v1/account/invoices?limit=50` (max 200) -> `[{id, status, amount_zat, received_zat, overpaid_zat, address, txid, created_at, expires_at, paid_at}]`
+- `GET /v1/account/export.csv?from=<unix>&to=<unix>&kind=invoices|payments` (session auth; `kind` defaults to `invoices`, range filters on invoice `created_at`, default all; max 50000 rows) -> `text/csv` attachment `lunaz-<kind>-<from>-<to>.csv`, header row always, RFC 4180 quoting. ZEC amounts are exact 8-decimal strings.
+  - `invoices`: `invoice_id, created_at, paid_at, status, amount_zec, received_zec, overpaid_zec, usd_rate, received_usd, txid, paid_with, origin_chain, origin_amount, swap_status`. Dates are ISO 8601 UTC. `usd_rate` (USD per ZEC) is recorded from the 1Click price when the invoice turns paid/underpaid; older invoices have none, so `usd_rate`/`received_usd` are empty. `paid_with` is `ZEC` or the swap symbol once the swap succeeded.
+  - `payments`: `txid, action_index, pool (orchard|ironwood), invoice_id, value_zec, block_height (empty while mempool only), invoice_status`.
+  - Privacy: the ledger comes from payments Lunaz decrypts with the merchant's viewing key. Nothing on chain links them, and only the logged-in merchant (and whoever they hand the file to, e.g. their accountant) sees it.
 
 - `POST /v1/invoices` (Bearer api key `lz_...`; 400 until a UFVK is set) `{amount_zat, expires_in_secs?=900}` (`expires_in_secs` is clamped to 60..86400; `amount_zat` must be 1..21e14) -> `{id, address, amount_zat, zip321_uri, status, expires_at}`
 - `GET /v1/invoices/{id}` -> `{status, amount_zat, received_zat, overpaid_zat, txid, expires_at, swap}`; `swap` is null or `{status, symbol, blockchain, deposit_address, amount_in_formatted, deadline}`

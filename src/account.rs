@@ -17,7 +17,7 @@ use sha2::Sha256;
 use std::sync::{Arc, LazyLock};
 use zcash_protocol::consensus::Network;
 
-type S = State<Arc<St>>;
+pub type S = State<Arc<St>>;
 type NoBody = Result<StatusCode, AppErr>;
 
 const SESSION_SECS: i64 = 30 * 86400;
@@ -60,7 +60,7 @@ fn new_session(st: &St, mid: i64) -> anyhow::Result<Value> {
     Ok(json!({"token": t}))
 }
 
-fn auth(st: &St, h: &HeaderMap) -> Result<i64, AppErr> {
+pub fn auth(st: &St, h: &HeaderMap) -> Result<i64, AppErr> {
     let t = bearer(h).ok_or_else(|| bad(StatusCode::UNAUTHORIZED, "missing session token"))?;
     st.db
         .lock()
