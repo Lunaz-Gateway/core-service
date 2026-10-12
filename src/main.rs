@@ -41,7 +41,7 @@ pub fn app(st: Arc<St>) -> Router {
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS merchants(id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, name TEXT NOT NULL,
-  ufvk TEXT, webhook_url TEXT, webhook_secret TEXT NOT NULL, next_index INTEGER NOT NULL DEFAULT 0);
+  ufvk TEXT UNIQUE, webhook_url TEXT, webhook_secret TEXT NOT NULL, next_index INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS api_keys(id INTEGER PRIMARY KEY, merchant_id INTEGER NOT NULL, name TEXT NOT NULL, prefix TEXT NOT NULL,
   key_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER);
 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, merchant_id INTEGER NOT NULL, expires_at INTEGER NOT NULL);

@@ -126,7 +126,13 @@ pub async fn set_ufvk(State(st): S, h: HeaderMap, Json(b): Json<SetUfvk>) -> NoB
     let mid = auth(&st, &h)?;
     parse_ufvk(&st.net, &b.ufvk).map_err(|e| bad(StatusCode::BAD_REQUEST, &e.to_string()))?;
     // Conditional update keeps set-once atomic.
-    let n = st.db.lock().unwrap().execute("UPDATE merchants SET ufvk=?1 WHERE id=?2 AND ufvk IS NULL", params![b.ufvk, mid])?;
+    // Two accounts sharing a UFVK would derive identical invoice addresses.
+    let n = match st.db.lock().unwrap().execute("UPDATE merchants SET ufvk=?1 WHERE id=?2 AND ufvk IS NULL", params![b.ufvk, mid]) {
+        Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+            return Err(bad(StatusCode::CONFLICT, "viewing key is already used by another account"));
+        }
+        r => r?,
+    };
     if n == 0 {
         return Err(bad(StatusCode::CONFLICT, "viewing key already set"));
     }
