@@ -23,6 +23,7 @@ pub struct St {
     pub jwt: Option<String>,
     pub assets: Mutex<Option<(i64, Vec<serde_json::Value>)>>,
     pub limits: limit::Limiter,
+    pub zec_price: Mutex<Option<f64>>,
 }
 
 pub fn now() -> i64 {
@@ -83,6 +84,19 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries(id INTEGER PRIMARY KEY, merchant_i
   status_code INTEGER, error TEXT, attempt INTEGER NOT NULL, created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS webhook_deliveries_merchant ON webhook_deliveries(merchant_id, id);";
 
+/// Idempotent column additions for databases created by older versions.
+fn migrate(db: &Connection) -> rusqlite::Result<()> {
+    let has: bool = db.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('invoices') WHERE name='paid_usd_rate'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has {
+        db.execute("ALTER TABLE invoices ADD COLUMN paid_usd_rate REAL", [])?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -94,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let db = Connection::open(env("LUNAZ_DB").unwrap_or("lunaz.db".into()))?;
     db.execute_batch(SCHEMA)?;
+    migrate(&db)?;
     let st = Arc::new(St {
         db: Mutex::new(db),
         net,
@@ -105,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         jwt: env("LUNAZ_ONECLICK_JWT").filter(|j| !j.is_empty()),
         assets: Mutex::new(None),
         limits: Default::default(),
+        zec_price: Mutex::new(None),
     });
 
     tokio::spawn(watcher::scanner(st.clone()));
@@ -132,6 +148,7 @@ mod tests {
     pub fn test_st() -> Arc<St> {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(SCHEMA).unwrap();
+        migrate(&db).unwrap();
         Arc::new(St {
             db: Mutex::new(db),
             net: Network::TestNetwork,
@@ -141,6 +158,7 @@ mod tests {
             jwt: None,
             assets: Mutex::new(None),
             limits: Default::default(),
+            zec_price: Mutex::new(None),
         })
     }
 

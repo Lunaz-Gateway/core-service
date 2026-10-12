@@ -17,7 +17,7 @@ use zcash_protocol::consensus::{BlockHeight, BranchId};
 type Client = CompactTxStreamerClient<Channel>;
 
 // Ironwood (NU6.3) actions share the payments key space with Orchard, so offset their index.
-const IRONWOOD_IDX: usize = 1 << 20;
+pub const IRONWOOD_IDX: usize = 1 << 20;
 
 struct Key {
     merchant: i64,
@@ -321,6 +321,20 @@ fn transition(st: &Arc<St>, db: &Connection, id: &str, txid: Option<&str>) -> Re
         params![new, txid, now(), id],
     )?;
     tracing::info!("invoice {id} -> {new} ({received}/{amount} zat)");
+    if matches!(new, "paid" | "underpaid") {
+        // Rate lookup must never block the transition, so it runs detached.
+        if let Ok(h) = tokio::runtime::Handle::try_current() {
+            let (st, id) = (st.clone(), id.to_string());
+            h.spawn(async move {
+                if let Some(p) = crate::swap::zec_price(&st).await {
+                    let _ = st.db.lock().unwrap().execute(
+                        "UPDATE invoices SET paid_usd_rate=?1 WHERE id=?2",
+                        params![p, id],
+                    );
+                }
+            });
+        }
+    }
     let _ = st.events.send((id.into(), new.into()));
     if let Some(t) = hook_type(new) {
         crate::hook::notify(st, db, id, t)?;

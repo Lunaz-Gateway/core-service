@@ -68,8 +68,20 @@ async fn assets(st: &St) -> anyhow::Result<Vec<Value>> {
         .json()
         .await?;
     let v = curate(&toks);
+    *st.zec_price.lock().unwrap() = toks
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|t| t["assetId"] == ZEC)
+        .and_then(|t| t["price"].as_f64());
     *st.assets.lock().unwrap() = Some((now(), v.clone()));
     Ok(v)
+}
+
+/// ZEC price in USD from the cached 1Click token list; None when unavailable.
+pub async fn zec_price(st: &St) -> Option<f64> {
+    assets(st).await.ok()?;
+    st.zec_price.lock().unwrap().filter(|p| *p > 0.0)
 }
 
 pub async fn list_assets(State(st): State<Arc<St>>) -> R {
@@ -80,7 +92,7 @@ pub async fn list_assets(State(st): State<Arc<St>>) -> R {
     Ok(Json(v.into()))
 }
 
-fn iso(t: i64) -> String {
+pub fn iso(t: i64) -> String {
     let (d, s) = (t.div_euclid(86400), t.rem_euclid(86400));
     let z = d + 719468;
     let (era, doe) = (z.div_euclid(146097), z.rem_euclid(146097));
