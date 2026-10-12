@@ -100,10 +100,7 @@ pub async fn create_invoice(
     if b.amount_zat == 0 || Zatoshis::from_u64(b.amount_zat).is_err() {
         return Err(bad(StatusCode::BAD_REQUEST, "invalid amount_zat"));
     }
-    let ttl = b.expires_in_secs.unwrap_or(900);
-    if ttl <= 0 {
-        return Err(bad(StatusCode::BAD_REQUEST, "invalid expires_in_secs"));
-    }
+    let ttl = b.expires_in_secs.unwrap_or(900).clamp(60, 86400);
     let id = uuid::Uuid::new_v4().to_string();
     let (created, expires) = (now(), now() + ttl);
     let db = st.db.lock().unwrap();
