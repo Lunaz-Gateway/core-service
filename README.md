@@ -7,7 +7,7 @@ Non-custodial shielded Zcash payment gateway. Merchants sign up, register a Unif
 - **Invoice addresses.** Each invoice address is derived from the merchant's UIVK at a fresh diversifier index, starting at an offset of 2^80 so it never collides with addresses the merchant uses elsewhere.
 - **Watcher.** A scanner reads compact blocks from lightwalletd (gRPC over TLS) and trial-decrypts Orchard and Ironwood actions with every merchant's viewing key. A second task does the same for the mempool, so payments show as `detected` before they are mined.
 - **Cross-chain.** A buyer can pay in another asset through NEAR Intents 1Click. The buyer sends funds on their own chain and 1Click delivers ZEC to the invoice address. The watcher sees the ZEC as usual. Swap status is polled every 10 s.
-- **Webhooks.** Signed POSTs on invoice and swap events, retried in-process, every attempt logged.
+- **Webhooks.** Signed POSTs on invoice, swap, withdrawal and plan events. Every event is stored, retried up to 3 times and keeps a final status; failed ones can be retried by hand.
 - **Storage.** One SQLite file (bundled rusqlite). Tables are created on start; older databases are migrated in place.
 
 ## Privacy and security model
@@ -137,11 +137,17 @@ Statuses: `pending` -> `detected` (seen in mempool or mined) -> `paid` (mined su
 ### Webhooks
 
 - `GET /v1/account/webhook` -> `{url, secret}`; `PUT` `{url|null}` -> 204; `POST /v1/account/webhook/rotate` -> `{secret}`; `POST /v1/account/webhook/test` -> `{status}` or `{error}` (single attempt)
-- `GET /v1/account/webhook/deliveries?limit=50` (max 200) -> newest first `[{id, invoice_id, type, url, status_code, error, attempt, created_at}]`, one row per attempt.
-- Delivery: POST with header `X-Lunaz-Signature` = hex HMAC-SHA256 of the raw body, keyed with the webhook secret. Compare in constant time.
-- Body always: `{type, invoice_id, status, amount_zat, received_zat, overpaid_zat, txid, swap}`. `swap` is `{asset, blockchain, amount_in_formatted, status}` or null.
-- Types: `invoice.paid`, `invoice.underpaid`, `swap.refunded`, `swap.failed`, `swap.incomplete_deposit` (the swap ones leave the invoice `pending`; the buyer can start another swap or pay ZEC), and `test` (`invoice_id: null`).
-- A non-2xx or network error is retried after 10 s, 60 s and 300 s (4 attempts in total).
+- `GET /v1/account/webhook/events?status=pending|delivered|failed&limit=50` (max 200) -> newest first `[{id, type, invoice_id, status, attempts, max_attempts: 3, next_attempt_at, last_status_code, last_error, created_at, updated_at, deliveries: [{attempt, status_code, error, created_at}]}]`
+- `POST /v1/account/webhook/events/{id}/retry` -> the event, now `pending` with `attempts` 0; 409 unless the event is `failed`, 404 if unknown.
+- `POST /v1/account/webhook/events/retry-failed` -> `{retried: n}`; requeues the failed events of the last 7 days (max 100).
+- `GET /v1/account/webhook/deliveries?limit=50` (max 200) -> newest first `[{id, invoice_id, type, url, status_code, error, attempt, created_at, event_id}]`, one row per attempt.
+- Delivery: POST with header `X-Lunaz-Signature` = hex HMAC-SHA256 of the raw body, keyed with the merchant's current webhook secret (at send time). Compare in constant time.
+- Body always: `{type, invoice_id, status, amount_zat, received_zat, overpaid_zat, txid, swap}` (invoice events). `swap` is `{asset, blockchain, amount_in_formatted, status}` or null.
+- Types: `invoice.paid`, `invoice.underpaid`, `swap.refunded`, `swap.failed`, `swap.incomplete_deposit` (the swap ones leave the invoice `pending`; the buyer can start another swap or pay ZEC), `withdrawal.updated`, `plan.updated` and `test` (`invoice_id: null`).
+- Events are stored in the database before sending, so pending events survive a restart. A background loop (every 2 s) sends due events. Statuses: `pending` -> `delivered` (any 2xx) | `failed`.
+- 3 attempts in total: immediately, after 10 s, after 60 s. A non-2xx or network error uses up an attempt; after the third the event is `failed` (`next_attempt_at: null`). No webhook URL at send time -> `failed` with `last_error: "no webhook URL configured"`. Events are only created while a URL is set.
+- `POST /v1/account/webhook/test` makes one synchronous attempt (no retries) and stores a `test` event with its final status.
+- Delivered events are deleted after 30 days, failed ones after 90 days (with their attempt logs).
 
 ### Off-ramp (withdraw to bank, session auth)
 
@@ -159,7 +165,7 @@ Mock mode: ZEC/USD is the cached 1Click price, USD -> fiat is `LUNAZ_MOCK_FX` (i
 - `POST /v1/account/withdrawals/{id}/simulate-deposit` (mock only, 404 otherwise): `awaiting_deposit` -> `deposit_received`, then `converting`, `payout_processing`, `completed` at 5 s steps.
 - `POST /v1/account/withdrawals/{id}/cancel`: only before `deposit_received`. Illegal transitions return 409.
 
-Statuses: `quote` (never stored) -> `awaiting_kyc` -> `awaiting_deposit` -> `deposit_received` -> `converting` -> `payout_processing` -> `completed`; also `expired` (quote or deposit window passed, swept every 10 s), `failed`, `cancelled`. Every change is logged as an event and sent to the merchant webhook as `withdrawal.updated` (`{type, invoice_id: null, withdrawal_id, status, amount_zat, fiat_currency, fiat_amount}`), signed and retried like the invoice events.
+Statuses: `quote` (never stored) -> `awaiting_kyc` -> `awaiting_deposit` -> `deposit_received` -> `converting` -> `payout_processing` -> `completed`; also `expired` (quote or deposit window passed, swept every 10 s), `failed`, `cancelled`. Every change is logged as an event and sent to the merchant webhook as `withdrawal.updated` (`{type, invoice_id: null, withdrawal_id, status, amount_zat, fiat_currency, fiat_amount}`), queued, signed and retried like the invoice events.
 
 ### Plans and billing
 
@@ -198,6 +204,6 @@ All features are on every plan; only volume is limited. Existing merchants are o
 ## Known limitations
 
 - Chain reorgs are not handled.
-- Webhook retries, exchange limits and swap request limits are in memory: lost on restart, not shared between instances. Run a single instance.
+- Exchange limits and swap request limits are in memory: lost on restart, not shared between instances. Run a single instance.
 - Swaps need an invoice of about 0.001 ZEC (100000 zat) or more.
 - The viewing key cannot be changed once set. Databases from older versions are migrated on startup: stored UFVKs are converted to UIVKs in place (invoice addresses stay valid).
