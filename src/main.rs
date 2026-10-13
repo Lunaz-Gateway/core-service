@@ -158,6 +158,7 @@ fn migrate(db: &Connection, net: &Network) -> rusqlite::Result<()> {
         ("merchants", "plan_expires_at", "INTEGER"),
         ("webhook_deliveries", "event_id", "TEXT"),
         ("payments", "seen_at", "INTEGER"),
+        ("invoices", "extended_at", "INTEGER"),
     ] {
         let has: bool = db.query_row(
             "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name=?2",

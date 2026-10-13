@@ -110,6 +110,23 @@ pub fn iso(t: i64) -> String {
     )
 }
 
+const SWAP_SECS: i64 = 1800;
+
+/// (invoice expiry, swap deadline). An invoice too close to expiry is extended once, never past its original expiry + 30 min; billing invoices never.
+fn window(expires: i64, extended: bool, billing: bool, t: i64) -> Result<(i64, i64), &'static str> {
+    if expires >= t + 600 {
+        return Ok((expires, expires.min(t + SWAP_SECS)));
+    }
+    if billing {
+        return Err("billing invoice expires too soon for a swap; start a new checkout");
+    }
+    if extended {
+        return Err("invoice expires too soon for a swap; pay in ZEC");
+    }
+    let e = (t + SWAP_SECS).min(expires + SWAP_SECS);
+    Ok((e, e))
+}
+
 #[derive(Deserialize)]
 pub struct NewSwap {
     asset_id: String,
@@ -121,14 +138,16 @@ pub async fn create_swap(
     Path(id): Path<String>,
     Json(b): Json<NewSwap>,
 ) -> Result<(StatusCode, Json<Value>), AppErr> {
-    let (status, amount, address, expires): (String, i64, String, i64) = st
+    type Inv = (String, i64, String, i64, bool, bool);
+    let (status, amount, address, expires, extended, billing): Inv = st
         .db
         .lock()
         .unwrap()
         .query_row(
-            "SELECT status, amount_zat, address, expires_at FROM invoices WHERE id=?1",
+            "SELECT status, amount_zat, address, expires_at, extended_at IS NOT NULL,
+             EXISTS(SELECT 1 FROM subscriptions WHERE invoice_id=invoices.id) FROM invoices WHERE id=?1",
             [&id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )
         .optional()?
         .ok_or_else(|| bad(StatusCode::NOT_FOUND, "no such invoice"))?;
@@ -143,6 +162,8 @@ pub async fn create_swap(
     if status != "pending" || expires < t {
         return Err(bad(StatusCode::CONFLICT, "invoice is not pending"));
     }
+    let (new_exp, deadline) =
+        window(expires, extended, billing, t).map_err(|m| bad(StatusCode::CONFLICT, m))?;
     // Replacing a swap abandons its deposit address, so only allow it before any deposit is seen.
     let active: Option<String> = st.db.lock().unwrap()
         .query_row("SELECT status FROM swaps WHERE invoice_id=?1 AND status NOT IN ('PENDING_DEPOSIT','REFUNDED','FAILED')", [&id], |r| r.get(0))
@@ -165,12 +186,6 @@ pub async fn create_swap(
         .iter()
         .find(|a| a["asset_id"] == b.asset_id)
         .ok_or_else(|| bad(StatusCode::BAD_REQUEST, "unsupported asset_id"))?;
-    // Too close to expiry for a swap to finish: extend the invoice. Otherwise the deadline never outlives the invoice.
-    let (new_exp, deadline) = if expires < t + 600 {
-        (t + 1800, t + 1800)
-    } else {
-        (expires, expires.min(t + 1800))
-    };
     // Invoice amount is the exact 1Click output: withdrawFee is added to amountIn, not deducted from amountOut.
     let body = json!({"dry": false, "swapType": "EXACT_OUTPUT", "slippageTolerance": 100, "originAsset": b.asset_id, "depositType": "ORIGIN_CHAIN",
         "destinationAsset": ZEC, "amount": amount.to_string(), "recipient": address, "recipientType": "DESTINATION_CHAIN",
@@ -205,8 +220,8 @@ pub async fn create_swap(
     )?;
     if new_exp > expires {
         db.execute(
-            "UPDATE invoices SET expires_at=?1 WHERE id=?2",
-            params![new_exp, id],
+            "UPDATE invoices SET expires_at=?1, extended_at=?3 WHERE id=?2 AND extended_at IS NULL",
+            params![new_exp, id, t],
         )?;
     }
     Ok((
@@ -329,5 +344,18 @@ mod tests {
             ]
         );
         assert_eq!(iso(1_760_000_000), "2025-10-09T08:53:20Z");
+    }
+
+    #[test]
+    fn extension_once() {
+        let t = 10_000;
+        assert_eq!(window(t + 900, false, false, t), Ok((t + 900, t + 900)));
+        assert_eq!(window(t + 5000, false, true, t), Ok((t + 5000, t + 1800)));
+        assert_eq!(window(t + 100, false, false, t), Ok((t + 1800, t + 1800)));
+        assert!(window(t + 100, true, false, t).is_err()); // already extended
+        assert!(window(t + 100, false, true, t).is_err()); // billing
+                                                           // the extended expiry is far enough out that the next call does not extend again
+        let (e, _) = window(t + 100, false, false, t).unwrap();
+        assert_eq!(window(e, true, false, t + 60), Ok((e, e)));
     }
 }

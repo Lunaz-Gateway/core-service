@@ -141,7 +141,7 @@ Statuses: `pending` -> `detected` (seen in mempool or mined) -> `paid` (mined su
 - `GET /v1/swap/assets` (public) -> `[{asset_id, symbol, blockchain, decimals, price_usd}]`: USDC/USDT/SOL/ETH/BTC/wNEAR on the main chains, cached 5 min.
 - `POST /v1/invoices/{id}/swap` (public) `{asset_id, refund_to}` -> 201 `{swap_id, deposit_address, deposit_memo, amount_in, amount_in_formatted, amount_in_usd, symbol, blockchain, deadline, time_estimate}`. 409 unless the invoice is pending; 429 after 5 requests per invoice per 10 min; 400 for an unknown asset or a refund address 1Click rejects (its message is passed through).
 - The quote is EXACT_OUTPUT for the invoice amount; 1Click's fee is added to `amount_in`. Minimum invoice for a swap is about 100000 zat.
-- Deadline = min(invoice expiry, now+30 min). If the invoice expires within 10 min, `expires_at` is extended to now+30 min so the swap can finish.
+- Deadline = min(invoice expiry, now+30 min). If the invoice expires within 10 min, `expires_at` is extended to now+30 min so the swap can finish. This happens at most once per invoice (`invoices.extended_at`) and never past the original expiry + 30 min; after that a swap on an invoice expiring within 10 min gets 409. Billing invoices are never extended: 409, start a new checkout.
 - One active swap per invoice: a new request replaces the old row, and the old deposit address is abandoned (do not send to it).
 - The swap may deliver slightly more or less ZEC than the invoice (see over/underpayment above).
 
