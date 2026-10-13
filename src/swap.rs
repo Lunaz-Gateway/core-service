@@ -14,6 +14,7 @@ use std::{sync::Arc, time::Duration};
 const API: &str = "https://1click.chaindefuser.com/v0";
 const ZEC: &str = "nep141:zec.omft.near";
 const FINAL: &str = "('SUCCESS','REFUNDED','FAILED')";
+const REPLACEABLE: &str = "('PENDING_DEPOSIT','REFUNDED','FAILED')";
 // (symbol, chain) pairs offered to buyers
 const WANT: &[(&str, &str)] = &[
     ("USDC", "sol"),
@@ -127,6 +128,51 @@ fn window(expires: i64, extended: bool, billing: bool, t: i64) -> Result<(i64, i
     Ok((e, e))
 }
 
+/// Status of a swap that must not be replaced: a deposit may already be on its way.
+fn active(db: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
+    db.query_row(
+        &format!("SELECT status FROM swaps WHERE invoice_id=?1 AND status NOT IN {REPLACEABLE}"),
+        [id],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// Re-checks invoice and swaps under the db lock (the quote round-trip happened without it), then replaces the swap. Some(reason) = conflict, nothing written.
+fn commit(
+    db: &Connection,
+    id: &str,
+    t: i64,
+    new_exp: i64,
+    insert: impl FnOnce(&Connection) -> rusqlite::Result<usize>,
+) -> rusqlite::Result<Option<String>> {
+    let tx = db.unchecked_transaction()?;
+    let (status, expires): (String, i64) = tx.query_row(
+        "SELECT status, expires_at FROM invoices WHERE id=?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if status != "pending" || expires < t {
+        return Ok(Some("invoice is not pending".into()));
+    }
+    if let Some(s) = active(&tx, id)? {
+        return Ok(Some(format!("a swap is already in progress ({s})")));
+    }
+    tx.execute(
+        &format!("DELETE FROM swaps WHERE invoice_id=?1 AND status IN {REPLACEABLE}"),
+        [id],
+    )?;
+    insert(&tx)?;
+    if new_exp > expires {
+        tx.execute(
+            "UPDATE invoices SET expires_at=?1, extended_at=?3 WHERE id=?2 AND extended_at IS NULL",
+            params![new_exp, id, t],
+        )?;
+    }
+    tx.commit()?;
+    Ok(None)
+}
+
 #[derive(Deserialize)]
 pub struct NewSwap {
     asset_id: String,
@@ -164,11 +210,7 @@ pub async fn create_swap(
     }
     let (new_exp, deadline) =
         window(expires, extended, billing, t).map_err(|m| bad(StatusCode::CONFLICT, m))?;
-    // Replacing a swap abandons its deposit address, so only allow it before any deposit is seen.
-    let active: Option<String> = st.db.lock().unwrap()
-        .query_row("SELECT status FROM swaps WHERE invoice_id=?1 AND status NOT IN ('PENDING_DEPOSIT','REFUNDED','FAILED')", [&id], |r| r.get(0))
-        .optional()?;
-    if let Some(s) = active {
+    if let Some(s) = active(&st.db.lock().unwrap(), &id)? {
         return Err(bad(
             StatusCode::CONFLICT,
             &format!("a swap is already in progress ({s})"),
@@ -211,18 +253,17 @@ pub async fn create_swap(
     };
     let s = |k: &str| q[k].as_str().map(String::from);
     let sid = uuid::Uuid::new_v4().to_string();
-    let db = st.db.lock().unwrap();
-    db.execute("DELETE FROM swaps WHERE invoice_id=?1", [&id])?; // one active swap per invoice
-    db.execute(
-        "INSERT INTO swaps(id,invoice_id,origin_asset,symbol,blockchain,deposit_address,deposit_memo,amount_in,amount_in_formatted,amount_in_usd,refund_to,deadline,created_at,updated_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)",
-        params![sid, id, b.asset_id, a["symbol"].as_str(), a["blockchain"].as_str(), dep, s("depositMemo"), s("amountIn"), s("amountInFormatted"), s("amountInUsd"), refund, iso(deadline), t],
-    )?;
-    if new_exp > expires {
+    let conflict = commit(&st.db.lock().unwrap(), &id, t, new_exp, |db| {
         db.execute(
-            "UPDATE invoices SET expires_at=?1, extended_at=?3 WHERE id=?2 AND extended_at IS NULL",
-            params![new_exp, id, t],
-        )?;
+            "INSERT INTO swaps(id,invoice_id,origin_asset,symbol,blockchain,deposit_address,deposit_memo,amount_in,amount_in_formatted,amount_in_usd,refund_to,deadline,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)",
+            params![sid, id, b.asset_id, a["symbol"].as_str(), a["blockchain"].as_str(), dep, s("depositMemo"), s("amountIn"), s("amountInFormatted"), s("amountInUsd"), refund, iso(deadline), t],
+        )
+    })?;
+    if let Some(m) = conflict {
+        // the unused quote simply expires at its deadline
+        tracing::info!("swap quote for invoice {id} abandoned: {m}");
+        return Err(bad(StatusCode::CONFLICT, &m));
     }
     Ok((
         StatusCode::CREATED,
@@ -344,6 +385,75 @@ mod tests {
             ]
         );
         assert_eq!(iso(1_760_000_000), "2025-10-09T08:53:20Z");
+    }
+
+    fn swap(db: &Connection, sid: &str, status: &str) -> rusqlite::Result<usize> {
+        db.execute("INSERT INTO swaps(id,invoice_id,origin_asset,symbol,blockchain,deposit_address,amount_in,amount_in_formatted,refund_to,deadline,status,created_at,updated_at)
+            VALUES(?1,'inv','a','USDC','sol','dep','1','1','r','d',?2,0,0)", params![sid, status])
+    }
+
+    fn swaps(db: &Connection) -> Vec<(String, String)> {
+        db.prepare("SELECT id, status FROM swaps ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn commit_keeps_progressed_swap() {
+        let st = crate::tests::test_st();
+        let db = st.db.lock().unwrap();
+        let t = now();
+        db.execute("INSERT INTO invoices(id,merchant_id,div_index,address,amount_zat,status,created_at,expires_at) VALUES('inv',1,0,'addr',1,'pending',?1,?2)", params![t, t + 300]).unwrap();
+        swap(&db, "old", "PENDING_DEPOSIT").unwrap();
+        // the old swap got a deposit while the new quote was being fetched
+        db.execute("UPDATE swaps SET status='PROCESSING'", [])
+            .unwrap();
+        let r = commit(&db, "inv", t, t + 1800, |db| {
+            swap(db, "new", "PENDING_DEPOSIT")
+        });
+        assert_eq!(
+            r.unwrap().unwrap(),
+            "a swap is already in progress (PROCESSING)"
+        );
+        assert_eq!(swaps(&db), [("old".into(), "PROCESSING".into())]);
+        let e: (i64, Option<i64>) = db
+            .query_row("SELECT expires_at, extended_at FROM invoices", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(e, (t + 300, None)); // nothing written
+                                        // a replaceable one is swapped out and the invoice extended once
+        db.execute("UPDATE swaps SET status='REFUNDED'", [])
+            .unwrap();
+        assert_eq!(
+            commit(&db, "inv", t, t + 1800, |db| swap(
+                db,
+                "new",
+                "PENDING_DEPOSIT"
+            ))
+            .unwrap(),
+            None
+        );
+        assert_eq!(swaps(&db), [("new".into(), "PENDING_DEPOSIT".into())]);
+        let e: (i64, Option<i64>) = db
+            .query_row("SELECT expires_at, extended_at FROM invoices", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(e, (t + 1800, Some(t)));
+        // invoice paid meanwhile
+        db.execute("UPDATE invoices SET status='paid'", []).unwrap();
+        assert!(commit(&db, "inv", t, t + 1800, |db| swap(
+            db,
+            "x",
+            "PENDING_DEPOSIT"
+        ))
+        .unwrap()
+        .is_some());
+        assert_eq!(swaps(&db).len(), 1);
     }
 
     #[test]
