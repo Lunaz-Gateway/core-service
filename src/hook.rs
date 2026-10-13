@@ -6,14 +6,19 @@ use rusqlite::{params, Connection};
 use serde_json::json;
 use sha2::Sha256;
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Webhook HTTP client and URL policy.
 pub struct Cfg {
     http: reqwest::Client,
+    /// In-flight sends per merchant, and a global cap.
+    busy: Mutex<HashMap<i64, usize>>,
+    slots: Arc<Semaphore>,
     /// Dev only: private/loopback targets, any port, plain http.
     pub allow_private: bool,
     pub allow_http: bool,
@@ -31,6 +36,8 @@ impl Cfg {
         }
         Ok(Cfg {
             http: b.build()?,
+            busy: Default::default(),
+            slots: Arc::new(Semaphore::new(PARALLEL)),
             allow_private,
             allow_http,
         })
@@ -281,32 +288,97 @@ pub async fn send_test(
     send(st, &id, false).await
 }
 
-/// Claims due pending events (lease) and sends each one.
-pub async fn tick(st: Arc<St>) {
-    let ids: Vec<String> = (|| -> rusqlite::Result<_> {
-        let db = st.db.lk();
-        let t = now();
-        let mut q = db.prepare(
-            "UPDATE webhook_events SET next_attempt_at=?1 WHERE id IN
-             (SELECT id FROM webhook_events WHERE status='pending' AND next_attempt_at<=?2 ORDER BY next_attempt_at LIMIT 50) RETURNING id",
-        )?;
-        let v = q.query_map(params![t + LEASE, t], |r| r.get(0))?.collect();
-        v
-    })()
-    .unwrap_or_default();
-    for id in ids {
-        match send(&st, &id, true).await {
-            Err(e) => tracing::warn!("webhook event {id}: {e:#}"),
-            Ok(Err(e)) => tracing::warn!("webhook event {id}: {e}"),
-            Ok(Ok(_)) => {}
+const PARALLEL: usize = 16;
+const PER_MERCHANT: usize = 2;
+
+/// One in-flight send; frees the merchant's and the global slot on drop.
+struct Slot {
+    st: Arc<St>,
+    mid: i64,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut b = self.st.hook.busy.lk();
+        if let Some(n) = b.get_mut(&self.mid) {
+            *n -= 1;
+            if *n == 0 {
+                b.remove(&self.mid);
+            }
         }
     }
+}
+
+/// Leases due events while slots are free: at most PER_MERCHANT in flight per merchant, PARALLEL overall.
+fn claim(st: &Arc<St>) -> Vec<(String, Slot)> {
+    let db = st.db.lk();
+    let t = now();
+    let due: Vec<(String, i64)> = db
+        .prepare(
+            // a merchant with a deep backlog cannot crowd the others out of the batch
+            "SELECT id, merchant_id FROM (SELECT id, merchant_id, next_attempt_at,
+               ROW_NUMBER() OVER (PARTITION BY merchant_id ORDER BY next_attempt_at) AS n
+             FROM webhook_events WHERE status='pending' AND next_attempt_at<=?1)
+             WHERE n<=?2 ORDER BY next_attempt_at LIMIT 200",
+        )
+        .and_then(|mut q| {
+            q.query_map(params![t, PER_MERCHANT], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut busy = st.hook.busy.lk();
+    let mut out = vec![];
+    for (id, mid) in due {
+        if busy.get(&mid).copied().unwrap_or(0) >= PER_MERCHANT {
+            continue;
+        }
+        let Ok(p) = st.hook.slots.clone().try_acquire_owned() else {
+            break;
+        };
+        if db
+            .execute(
+                "UPDATE webhook_events SET next_attempt_at=?1 WHERE id=?2 AND status='pending'",
+                params![t + LEASE, id],
+            )
+            .is_err()
+        {
+            continue;
+        }
+        *busy.entry(mid).or_default() += 1;
+        out.push((
+            id,
+            Slot {
+                st: st.clone(),
+                mid,
+                _permit: p,
+            },
+        ));
+    }
+    out
+}
+
+/// Sends the claimed events concurrently and waits for them.
+pub async fn tick(st: Arc<St>) {
+    let mut set = tokio::task::JoinSet::new();
+    for (id, slot) in claim(&st) {
+        let st = st.clone();
+        set.spawn(async move {
+            match send(&st, &id, true).await {
+                Err(e) => tracing::warn!("webhook event {id}: {e:#}"),
+                Ok(Err(e)) => tracing::warn!("webhook event {id}: {e}"),
+                Ok(Ok(_)) => {}
+            }
+            drop(slot);
+        });
+    }
+    while set.join_next().await.is_some() {}
 }
 
 /// Background sender: survives restarts because all state is in the database.
 pub async fn run(st: Arc<St>) {
     loop {
-        tick(st.clone()).await;
+        tokio::spawn(tick(st.clone())); // a slow tick never holds up the next one
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
@@ -518,6 +590,63 @@ mod tests {
         .await;
         let dev = Cfg::new(true, false).unwrap();
         assert_eq!(post(&dev, &a, "s", "{}".into()).await, Err("timed out"));
+    }
+
+    // A merchant with a slow endpoint holds at most 2 slots and does not delay another merchant.
+    #[tokio::test]
+    async fn slow_merchant_does_not_block_others() {
+        let slow = serve(Router::new().route(
+            "/",
+            any(|| async {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                ""
+            }),
+        ))
+        .await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let fast = serve(Router::new().route(
+            "/",
+            any(move || {
+                h.fetch_add(1, Ordering::SeqCst);
+                async { "" }
+            }),
+        ))
+        .await;
+        let st = crate::tests::test_st();
+        {
+            let db = st.db.lk();
+            for (id, u) in [(1, &slow), (2, &fast)] {
+                db.execute("INSERT INTO merchants(id,email,password_hash,name,webhook_url,webhook_secret) VALUES(?1,?1,'','',?2,'s')", params![id, u]).unwrap();
+            }
+            for _ in 0..3 {
+                insert(&db, 1, None, "test", "{}", Some(0)).unwrap();
+            }
+            insert(&db, 2, None, "test", "{}", Some(1)).unwrap();
+        }
+        let t0 = std::time::Instant::now();
+        let tk = tokio::spawn(tick(st.clone()));
+        while hits.load(Ordering::SeqCst) == 0 {
+            assert!(
+                t0.elapsed() < Duration::from_secs(1),
+                "fast merchant waited"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(st.hook.busy.lk().get(&1), Some(&2));
+        tk.await.unwrap();
+        assert!(st.hook.busy.lk().is_empty());
+        assert_eq!(st.hook.slots.available_permits(), PARALLEL);
+        let left: i64 = st
+            .db
+            .lk()
+            .query_row(
+                "SELECT COUNT(*) FROM webhook_events WHERE merchant_id=1 AND attempts=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 1); // third one waits for a free slot
     }
 
     #[test]
