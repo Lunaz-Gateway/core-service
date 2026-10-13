@@ -300,6 +300,12 @@ pub async fn create(
     Json(b): Json<Req>,
 ) -> Result<(StatusCode, Json<Value>), AppErr> {
     let mid = auth(&st, &h)?;
+    if !st.limits.hit(&format!("wd:{mid}"), 10, 3600, now()) {
+        return Err(bad(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many withdrawals, try again later",
+        ));
+    }
     let q = quote(&st, b.amount_zat, &b.currency).await?;
     let (addr, uri, pref) = create_order(&st, &q)?;
     let (id, t) = (uuid::Uuid::new_v4().to_string(), now());

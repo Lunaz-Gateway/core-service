@@ -2,7 +2,7 @@
 use crate::Lk;
 use std::{collections::HashMap, sync::Mutex};
 
-pub const WINDOW: i64 = 900; // longest window in use; purge() drops older hits
+pub const WINDOW: i64 = 3600; // longest window in use; purge() drops older hits
 
 #[derive(Default)]
 pub struct Limiter(Mutex<HashMap<String, Vec<i64>>>);
