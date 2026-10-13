@@ -27,6 +27,9 @@ Non-custodial shielded Zcash payment gateway. Merchants sign up, register a Unif
 | `LUNAZ_DB` | `lunaz.db` (Docker image: `/data/lunaz.db`) | SQLite path |
 | `LUNAZ_BIND` | `0.0.0.0:8080` | listen address |
 | `LUNAZ_ONECLICK_JWT` | unset | 1Click token; without it 1Click adds a 0.25% fee |
+| `LUNAZ_OFFRAMP` | `mock` | off-ramp provider: `mock` or `transfi` (not implemented yet: off-ramp requests return 501) |
+| `LUNAZ_MOCK_FX` | `{"IDR":16400,"USD":1}` | mock only: USD -> fiat rates (indicative), also defines the supported currencies |
+| `LUNAZ_MOCK_ZEC_USD` | unset | mock only: fixed ZEC/USD price instead of the 1Click price |
 | `RUST_LOG` | tracing default | log filter |
 
 ## Run locally
@@ -123,6 +126,24 @@ Statuses: `pending` -> `detected` (seen in mempool or mined) -> `paid` (mined su
 - Body always: `{type, invoice_id, status, amount_zat, received_zat, overpaid_zat, txid, swap}`. `swap` is `{asset, blockchain, amount_in_formatted, status}` or null.
 - Types: `invoice.paid`, `invoice.underpaid`, `swap.refunded`, `swap.failed`, `swap.incomplete_deposit` (the swap ones leave the invoice `pending`; the buyer can start another swap or pay ZEC), and `test` (`invoice_id: null`).
 - A non-2xx or network error is retried after 10 s, 60 s and 300 s (4 attempts in total).
+
+### Off-ramp (withdraw to bank, session auth)
+
+Mocked for now; the real provider will be TransFi (`LUNAZ_OFFRAMP=transfi`, currently 501 `off-ramp provider not configured`). The merchant is the provider's customer (KYC and bank link happen with the provider). The merchant sends ZEC from their own wallet to the provider's deposit address and the provider pays fiat to their bank. Lunaz only creates the order, shows the deposit address/QR and tracks status. It never holds funds and never stores bank account numbers or KYC data (only a display label such as `BCA ••••1234`).
+
+Privacy: the provider's deposit address is transparent, so the merchant must deshield from their shielded wallet and that leg is public on chain.
+
+Mock mode: ZEC/USD is the cached 1Click price, USD -> fiat is `LUNAZ_MOCK_FX` (indicative, not a real rate). Fees: provider 1.5% plus 0.0001 ZEC network fee; fiat is computed in integer minor units (2 dp). The deposit address is a deliberately invalid fake (`t1SANDBOX...`, `sandbox: true`): never send funds to it.
+
+- `GET /v1/account/offramp` -> `{provider, sandbox, currencies, min_zat, received_zat, zec_usd}`. `received_zat` is the sum of mined payments to this merchant's invoices ("received through Lunaz"), not a wallet balance.
+- `POST /v1/account/withdrawals/quote` `{amount_zat, currency}` -> `{amount_zat, currency, rate, fee_fiat, network_fee_zat, fiat_amount, expires_at}`. Not persisted, valid 10 min. 400 below `min_zat` (100000), above 21e14 or for an unsupported currency; 503 without a ZEC price.
+- `POST /v1/account/withdrawals` `{amount_zat, currency}` -> 201 withdrawal `{id, provider, sandbox, status, amount_zat, fiat_currency, fiat_amount, rate, fee_fiat, network_fee_zat, deposit_address, deposit_uri, bank_label, provider_ref, created_at, updated_at, expires_at, events}`; starts at `awaiting_kyc`.
+- `GET /v1/account/withdrawals?limit=50` (max 200, newest first) and `GET /v1/account/withdrawals/{id}`; `events` is `[{status, note, created_at}]`.
+- `POST /v1/account/withdrawals/{id}/kyc` `{bank_name, account_last4}` (mock only; with TransFi the provider widget does this step and the route is 404). `account_last4` must be exactly 4 digits. Stores the label only and moves to `awaiting_deposit` with a 30 min window.
+- `POST /v1/account/withdrawals/{id}/simulate-deposit` (mock only, 404 otherwise): `awaiting_deposit` -> `deposit_received`, then `converting`, `payout_processing`, `completed` at 5 s steps.
+- `POST /v1/account/withdrawals/{id}/cancel`: only before `deposit_received`. Illegal transitions return 409.
+
+Statuses: `quote` (never stored) -> `awaiting_kyc` -> `awaiting_deposit` -> `deposit_received` -> `converting` -> `payout_processing` -> `completed`; also `expired` (quote or deposit window passed, swept every 10 s), `failed`, `cancelled`. Every change is logged as an event and sent to the merchant webhook as `withdrawal.updated` (`{type, invoice_id: null, withdrawal_id, status, amount_zat, fiat_currency, fiat_amount}`), signed and retried like the invoice events.
 
 ### Export (session auth)
 
