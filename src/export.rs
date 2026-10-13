@@ -1,16 +1,17 @@
 //! Accountant CSV export, built from the rows the viewing-key scanner decrypted.
 use crate::account::{auth, S};
 use crate::api::{bad, AppErr};
+use crate::now;
 use crate::swap::iso;
 use crate::watcher::IRONWOOD_IDX;
-use crate::Lk;
 use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use rusqlite::params;
+use rusqlite::{params, Connection, OpenFlags};
 use serde::Deserialize;
+use std::time::Duration;
 
 const MAX_ROWS: i64 = 50_000;
 
@@ -47,9 +48,49 @@ pub async fn export_csv(
     Query(q): Query<Q>,
 ) -> Result<Response, AppErr> {
     let mid = auth(&st, &h)?;
-    let kind = q.kind.as_deref().unwrap_or("invoices");
+    let kind = q.kind.clone().unwrap_or("invoices".into());
+    if kind != "invoices" && kind != "payments" {
+        return Err(bad(
+            StatusCode::BAD_REQUEST,
+            "kind must be invoices or payments",
+        ));
+    }
+    if !st.limits.hit(&format!("export:{mid}"), 5, 60, now()) {
+        return Err(bad(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many exports, try again in a minute",
+        ));
+    }
     let (from, to) = (q.from.unwrap_or(0), q.to.unwrap_or(i64::MAX));
-    let db = st.db.lk();
+    let (path, k) = (st.db_path.clone(), kind.clone());
+    // Own read-only connection off the async runtime: WAL readers never hold the shared db lock.
+    let out = tokio::task::spawn_blocking(move || build(&path, &k, mid, from, to))
+        .await
+        .map_err(anyhow::Error::from)??;
+    let r = |v: Option<i64>| v.map_or("all".into(), |v| v.to_string());
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!(
+                    "attachment; filename=\"lunaz-{kind}-{}-{}.csv\"",
+                    r(q.from),
+                    r(q.to)
+                ),
+            ),
+        ],
+        out,
+    )
+        .into_response())
+}
+
+fn build(path: &str, kind: &str, mid: i64, from: i64, to: i64) -> rusqlite::Result<String> {
+    let db = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    db.busy_timeout(Duration::from_secs(5))?;
     let mut out = String::new();
     match kind {
         "invoices" => {
@@ -137,29 +178,9 @@ pub async fn export_csv(
                 ]);
             }
         }
-        _ => {
-            return Err(bad(
-                StatusCode::BAD_REQUEST,
-                "kind must be invoices or payments",
-            ))
-        }
+        _ => {}
     }
-    let r = |v: Option<i64>| v.map_or("all".into(), |v| v.to_string());
-    Ok((
-        [
-            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!(
-                    "attachment; filename=\"lunaz-{kind}-{}-{}.csv\"",
-                    r(q.from),
-                    r(q.to)
-                ),
-            ),
-        ],
-        out,
-    )
-        .into_response())
+    Ok(out)
 }
 
 #[cfg(test)]

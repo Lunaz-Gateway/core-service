@@ -19,6 +19,7 @@ use zcash_protocol::consensus::Network;
 
 pub struct St {
     pub db: Mutex<Connection>,
+    pub db_path: String,
     pub net: Network,
     pub lwd: String,
     pub events: broadcast::Sender<(String, String)>,
@@ -298,11 +299,16 @@ async fn main() -> anyhow::Result<()> {
             opts.join(", ")
         );
     }
-    let db = Connection::open(env("LUNAZ_DB").unwrap_or("lunaz.db".into()))?;
+    let db_path = env("LUNAZ_DB").unwrap_or("lunaz.db".into());
+    let db = Connection::open(&db_path)?;
+    // WAL: export readers on their own connection do not block the writer.
+    db.pragma_update(None, "journal_mode", "WAL")?;
+    db.busy_timeout(std::time::Duration::from_secs(5))?;
     db.execute_batch(SCHEMA)?;
     migrate(&db, &net)?;
     let st = Arc::new(St {
         db: Mutex::new(db),
+        db_path,
         net,
         lwd: env("LUNAZ_LWD_URL").unwrap_or(default_lwd.into()),
         events: broadcast::channel(256).0,
@@ -384,6 +390,7 @@ pub mod tests {
         migrate(&db, &Network::TestNetwork).unwrap();
         Arc::new(St {
             db: Mutex::new(db),
+            db_path: ":memory:".into(),
             net: Network::TestNetwork,
             lwd: String::new(),
             events: broadcast::channel(16).0,
