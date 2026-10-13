@@ -148,7 +148,7 @@ async fn timeout(req: Request, next: Next) -> Response {
 
 /// Hardening headers; everything but the public static-ish lists is no-store.
 async fn security_headers(req: Request, next: Next) -> Response {
-    let cacheable = req.method() == Method::GET
+    let cacheable = matches!(*req.method(), Method::GET | Method::HEAD)
         && matches!(
             req.uri().path(),
             "/healthz" | "/v1/plans" | "/v1/swap/assets"
