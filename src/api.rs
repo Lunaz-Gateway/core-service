@@ -12,7 +12,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use zcash_address::ZcashAddress;
 use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedIncomingViewingKey};
 use zcash_protocol::{consensus::Network, memo::MemoBytes, value::Zatoshis};
@@ -215,19 +215,70 @@ pub async fn get_invoice(State(st): State<Arc<St>>, Path(id): Path<String>) -> R
     Ok(Json(v))
 }
 
+const WS_PER_INVOICE: usize = 5;
+const WS_PING: Duration = Duration::from_secs(30);
+const WS_MAX_LIFE: Duration = Duration::from_secs(3600);
+
+/// Holds a global and a per-invoice WebSocket slot until dropped.
+struct WsSlot {
+    st: Arc<St>,
+    id: String,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl WsSlot {
+    fn take(st: &Arc<St>, id: &str) -> Option<WsSlot> {
+        let permit = st.ws.clone().try_acquire_owned().ok()?;
+        let mut m = st.ws_per.lock().unwrap();
+        let n = m.entry(id.to_string()).or_default();
+        if *n >= WS_PER_INVOICE {
+            return None;
+        }
+        *n += 1;
+        Some(WsSlot {
+            st: st.clone(),
+            id: id.to_string(),
+            _permit: permit,
+        })
+    }
+}
+
+impl Drop for WsSlot {
+    fn drop(&mut self) {
+        let mut m = self.st.ws_per.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.id) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.id);
+            }
+        }
+    }
+}
+
 pub async fn invoice_ws(
     State(st): State<Arc<St>>,
     Path(id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let Some(slot) = WsSlot::take(&st, &id) else {
+        return bad(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many websocket connections",
+        )
+        .into_response();
+    };
     ws.on_upgrade(move |sock| async move {
         let _ = watch(st, id, sock).await;
+        drop(slot);
     })
 }
 
 async fn watch(st: Arc<St>, id: String, mut sock: WebSocket) -> anyhow::Result<()> {
     let mut rx = st.events.subscribe(); // subscribe before reading so no change is missed
     let mut cur = status_of(&st, &id)?.unwrap_or_else(|| "not_found".into());
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + WS_PING, WS_PING);
+    let end = tokio::time::sleep(WS_MAX_LIFE);
+    tokio::pin!(end);
     loop {
         let sw: Option<String> = st
             .db
@@ -243,19 +294,33 @@ async fn watch(st: Arc<St>, id: String, mut sock: WebSocket) -> anyhow::Result<(
         }
         sock.send(Message::text(m.to_string())).await?;
         if matches!(cur.as_str(), "paid" | "underpaid" | "expired" | "not_found") {
-            return Ok(());
+            break;
         }
-        cur = loop {
-            match rx.recv().await {
-                Ok((i, s)) if i == id => break s,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    break status_of(&st, &id)?.unwrap_or_default()
-                }
-                Err(_) => return Ok(()),
-                _ => {}
+        let next = loop {
+            tokio::select! {
+                m = sock.recv() => match m {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return Ok(()),
+                    _ => {}
+                },
+                r = rx.recv() => match r {
+                    Ok((i, s)) if i == id => break Some(s),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        break Some(status_of(&st, &id)?.unwrap_or_default())
+                    }
+                    Err(_) => return Ok(()),
+                    _ => {}
+                },
+                _ = ping.tick() => sock.send(Message::Ping(Default::default())).await?,
+                _ = &mut end => break None, // max lifetime
             }
         };
+        match next {
+            Some(s) => cur = s,
+            None => break,
+        }
     }
+    sock.send(Message::Close(None)).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -318,6 +383,21 @@ mod tests {
                 assert_eq!(from_ufvk, invoice_address(&net, &parsed, n).unwrap());
             }
         }
+    }
+
+    #[test]
+    fn ws_caps() {
+        let st = crate::tests::test_st();
+        let mut v: Vec<_> = (0..WS_PER_INVOICE)
+            .map(|_| WsSlot::take(&st, "a").unwrap())
+            .collect();
+        assert!(WsSlot::take(&st, "a").is_none());
+        assert!(WsSlot::take(&st, "b").is_some());
+        v.pop();
+        assert!(WsSlot::take(&st, "a").is_some());
+        v.clear();
+        assert!(st.ws_per.lock().unwrap().is_empty());
+        assert_eq!(st.ws.available_permits(), 2000);
     }
 
     #[test]

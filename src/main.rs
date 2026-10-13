@@ -30,6 +30,8 @@ pub struct St {
     pub off: offramp::Cfg,
     pub bill: billing::Cfg,
     pub internal: Option<String>,
+    pub ws: Arc<tokio::sync::Semaphore>,
+    pub ws_per: Mutex<std::collections::HashMap<String, usize>>,
 }
 
 pub fn now() -> i64 {
@@ -226,6 +228,12 @@ async fn main() -> anyhow::Result<()> {
         off: offramp::Cfg::from_env(env)?,
         bill: billing::Cfg::from_env(env)?,
         internal,
+        ws: Arc::new(tokio::sync::Semaphore::new(
+            env("LUNAZ_MAX_WS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2000),
+        )),
+        ws_per: Default::default(),
     });
 
     tokio::spawn(watcher::scanner(st.clone()));
@@ -279,6 +287,8 @@ pub mod tests {
             off: Default::default(),
             bill: Default::default(),
             internal: Some("t".repeat(32)),
+            ws: Arc::new(tokio::sync::Semaphore::new(2000)),
+            ws_per: Default::default(),
         })
     }
 

@@ -34,6 +34,7 @@ Non-custodial shielded Zcash payment gateway. Merchants sign up, register a Unif
 | `LUNAZ_INTERNAL_TOKEN` | unset | secret (>=32 chars) for `/v1/auth/exchange`; unset = endpoint returns 503; shorter aborts startup |
 | `LUNAZ_BILLING_MERCHANT_ID` | unset | id of the treasury merchant that receives subscription payments; unset = purchase endpoints return 503 `billing not configured` |
 | `LUNAZ_BILLING_SANDBOX` | unset | `1` enables `simulate-paid` (demos/tests) |
+| `LUNAZ_MAX_WS` | `2000` | maximum concurrent invoice WebSockets |
 | `RUST_LOG` | tracing default | log filter |
 
 ## Run locally
@@ -116,7 +117,7 @@ Sign-in is delegated to an identity provider (Magic, magic.link; email only). Th
 
 - `POST /v1/invoices` (API key; 400 until a viewing key is set) `{amount_zat, expires_in_secs?=900}`. `expires_in_secs` is clamped to 60..86400, `amount_zat` must be 1..21e14. -> `{id, address, amount_zat, zip321_uri, status, expires_at}`
 - `GET /v1/invoices/{id}` (public) -> `{status, amount_zat, received_zat, pending_zat, overpaid_zat, txid, expires_at, swap}`; `swap` is null or `{status, symbol, blockchain, deposit_address, amount_in_formatted, deadline}`
-- `GET /v1/invoices/{id}/ws` WebSocket: `{"status":...}` now and on each change, plus `"swap_status"` (1Click status) when a swap exists. Closes on paid, underpaid or expired.
+- `GET /v1/invoices/{id}/ws` WebSocket: `{"status":...}` now and on each change, plus `"swap_status"` (1Click status) when a swap exists. Closes on paid, underpaid or expired, and after 1 h at most. The server sends a Ping every 30 s and drops the socket when the client goes away. Limits: 5 sockets per invoice and `LUNAZ_MAX_WS` (default 2000) in total; over a limit the upgrade is refused with 429.
 
 Statuses: `pending` -> `detected` (seen in mempool or mined) -> `paid` (mined sum >= amount) | `underpaid` | `expired`.
 
