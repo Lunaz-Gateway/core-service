@@ -29,6 +29,7 @@ pub struct St {
     pub zec_price: Mutex<Option<f64>>,
     pub off: offramp::Cfg,
     pub bill: billing::Cfg,
+    pub internal: Option<String>,
 }
 
 pub fn now() -> i64 {
@@ -41,10 +42,11 @@ pub fn now() -> i64 {
 pub fn app(st: Arc<St>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/v1/auth/signup", post(account::signup))
-        .route("/v1/auth/login", post(account::login))
+        .route("/v1/auth/signup", post(account::removed))
+        .route("/v1/auth/login", post(account::removed))
         .route("/v1/auth/logout", post(account::logout))
-        .route("/v1/account", get(account::account))
+        .route("/v1/auth/exchange", post(account::exchange))
+        .route("/v1/account", get(account::account).put(account::set_name))
         .route("/v1/account/ufvk", put(account::set_ufvk))
         .route(
             "/v1/account/api-keys",
@@ -162,6 +164,10 @@ async fn main() -> anyhow::Result<()> {
         "test" => (Network::TestNetwork, "https://testnet.zec.rocks:443"),
         v => anyhow::bail!("LUNAZ_NETWORK must be test or main, got {v}"),
     };
+    let internal = env("LUNAZ_INTERNAL_TOKEN").filter(|t| !t.is_empty());
+    if internal.as_ref().is_some_and(|t| t.len() < 32) {
+        anyhow::bail!("LUNAZ_INTERNAL_TOKEN must be at least 32 characters");
+    }
     let db = Connection::open(env("LUNAZ_DB").unwrap_or("lunaz.db".into()))?;
     db.execute_batch(SCHEMA)?;
     migrate(&db)?;
@@ -179,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
         zec_price: Mutex::new(None),
         off: offramp::Cfg::from_env(env)?,
         bill: billing::Cfg::from_env(env)?,
+        internal,
     });
 
     tokio::spawn(watcher::scanner(st.clone()));
@@ -230,14 +237,8 @@ pub mod tests {
             zec_price: Mutex::new(None),
             off: Default::default(),
             bill: Default::default(),
+            internal: Some("t".repeat(32)),
         })
-    }
-
-    #[test]
-    fn password_roundtrip() {
-        let h = account::hash_pw("hunter2hunter2").unwrap();
-        assert!(h.starts_with("$argon2id$"));
-        assert!(account::check_pw("hunter2hunter2", &h) && !account::check_pw("wrong", &h));
     }
 
     #[tokio::test]
@@ -265,15 +266,23 @@ pub mod tests {
             }
         };
         let post = reqwest::Method::POST;
-        let (s, v) = call(
-            post.clone(),
-            "/v1/auth/signup",
-            "",
-            json!({"email": "A@b.co", "name": "n", "password": "password1"}),
-        )
-        .await;
-        assert_eq!(s, 201);
+        let it = "t".repeat(32);
+        let ex = json!({"email": " A@b.co "});
+        assert_eq!(
+            call(post.clone(), "/v1/auth/exchange", "x", ex.clone())
+                .await
+                .0,
+            401
+        );
+        let (s, v) = call(post.clone(), "/v1/auth/exchange", &it, ex.clone()).await;
+        assert!(s == 200 && v["new_account"] == true);
         let tok = v["token"].as_str().unwrap().to_string();
+        let (_, v2) = call(post.clone(), "/v1/auth/exchange", &it, ex).await;
+        assert!(v2["new_account"] == false && v2["merchant_id"] == v["merchant_id"]);
+        assert_eq!(
+            call(post.clone(), "/v1/auth/login", "", json!({})).await.0,
+            410
+        );
         let inv = json!({"amount_zat": 1000});
         let (s, v) = call(
             post.clone(),

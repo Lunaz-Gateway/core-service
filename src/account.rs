@@ -1,20 +1,16 @@
 use crate::api::{bad, bearer, parse_ufvk, rand_hex, sha_hex, AppErr, R};
 use crate::{now, St};
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
-};
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
 use hmac::{Hmac, Mac};
-use rusqlite::{params, ErrorCode, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use zcash_protocol::consensus::Network;
 
 pub type S = State<Arc<St>>;
@@ -22,34 +18,21 @@ type NoBody = Result<StatusCode, AppErr>;
 
 const SESSION_SECS: i64 = 30 * 86400;
 
-/// 10 attempts per email and 30 per client IP per 15 min on login/signup.
-// ponytail: behind a reverse proxy the IP is the proxy's, so the IP bucket is shared by everyone
-fn throttle(st: &St, ip: std::net::SocketAddr, email: &str) -> Result<(), AppErr> {
-    let t = now();
-    let email: String = email.chars().take(254).collect();
-    let l = &st.limits;
-    if l.hit(&format!("ip:{}", ip.ip()), 30, 900, t) && l.hit(&format!("email:{email}"), 10, 900, t)
-    {
-        return Ok(());
-    }
-    Err(bad(
-        StatusCode::TOO_MANY_REQUESTS,
-        "too many attempts, try again later",
-    ))
+pub fn norm_email(e: &str) -> Option<String> {
+    let e = e.trim().to_lowercase();
+    let ok = e.len() <= 254
+        && e.split_once('@').is_some_and(|(l, d)| {
+            !l.is_empty() && d.contains('.') && !d.starts_with('.') && !d.ends_with('.')
+        })
+        && !e.chars().any(|c| c.is_whitespace() || c.is_control());
+    ok.then_some(e)
 }
 
-pub fn hash_pw(pw: &str) -> anyhow::Result<String> {
-    Ok(Argon2::default()
-        .hash_password(pw.as_bytes(), &SaltString::generate(&mut OsRng))
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .to_string())
+pub fn ct_eq(a: &str, b: &str) -> bool {
+    use sha2::Digest;
+    let (x, y) = (Sha256::digest(a), Sha256::digest(b));
+    x.iter().zip(y.iter()).fold(0u8, |d, (p, q)| d | (p ^ q)) == 0
 }
-pub fn check_pw(pw: &str, phc: &str) -> bool {
-    PasswordHash::new(phc)
-        .is_ok_and(|h| Argon2::default().verify_password(pw.as_bytes(), &h).is_ok())
-}
-// Verified against when the email is unknown, so both paths cost the same.
-static DUMMY: LazyLock<String> = LazyLock::new(|| hash_pw("dummy").unwrap());
 
 fn new_session(st: &St, mid: i64) -> anyhow::Result<Value> {
     let t = rand_hex();
@@ -74,79 +57,68 @@ pub fn auth(st: &St, h: &HeaderMap) -> Result<i64, AppErr> {
         .ok_or_else(|| bad(StatusCode::UNAUTHORIZED, "invalid or expired session"))
 }
 
+pub async fn removed() -> AppErr {
+    bad(
+        StatusCode::GONE,
+        "password sign-in was removed; sign in with your email in the dashboard",
+    )
+}
+
 #[derive(Deserialize)]
-pub struct Signup {
+pub struct Exchange {
     email: String,
+}
+
+pub async fn exchange(State(st): S, h: HeaderMap, Json(b): Json<Exchange>) -> R {
+    let Some(want) = &st.internal else {
+        return Err(bad(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "internal auth not configured",
+        ));
+    };
+    if !bearer(&h).is_some_and(|t| ct_eq(t, want)) {
+        return Err(bad(StatusCode::UNAUTHORIZED, "invalid internal token"));
+    }
+    let email =
+        norm_email(&b.email).ok_or_else(|| bad(StatusCode::BAD_REQUEST, "invalid email"))?;
+    if !st.limits.hit(&format!("exch:{email}"), 20, 900, now()) {
+        return Err(bad(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many attempts, try again later",
+        ));
+    }
+    let db = st.db.lock().unwrap();
+    // INSERT OR IGNORE keeps create-or-reuse atomic under concurrent exchanges.
+    let new = db.execute(
+        "INSERT OR IGNORE INTO merchants(email,password_hash,name,webhook_secret) VALUES(?1,'','',?2)",
+        params![email, rand_hex()],
+    )? == 1;
+    let mid: i64 = db.query_row("SELECT id FROM merchants WHERE email=?1", [&email], |r| {
+        r.get(0)
+    })?;
+    drop(db);
+    let mut v = new_session(&st, mid)?;
+    v["new_account"] = new.into();
+    v["merchant_id"] = mid.into();
+    Ok(Json(v))
+}
+
+#[derive(Deserialize)]
+pub struct SetName {
     name: String,
-    password: String,
 }
 
-pub async fn signup(
-    State(st): S,
-    ConnectInfo(ip): ConnectInfo<std::net::SocketAddr>,
-    Json(b): Json<Signup>,
-) -> Result<(StatusCode, Json<Value>), AppErr> {
-    let email = b.email.trim().to_lowercase();
-    throttle(&st, ip, &email)?;
-    let err = |m| Err(bad(StatusCode::BAD_REQUEST, m));
-    if !email.contains('@') || email.len() > 254 {
-        return err("invalid email");
+pub async fn set_name(State(st): S, h: HeaderMap, Json(b): Json<SetName>) -> NoBody {
+    let mid = auth(&st, &h)?;
+    let n = b.name.trim();
+    if n.is_empty() || n.chars().count() > 80 {
+        return Err(bad(StatusCode::BAD_REQUEST, "name must be 1-80 characters"));
     }
-    if b.password.len() < 8 {
-        return err("password must be at least 8 characters");
-    }
-    if b.name.trim().is_empty() {
-        return err("name required");
-    }
-    let pw = b.password.clone();
-    let (hash, secret) = (
-        tokio::task::spawn_blocking(move || hash_pw(&pw)).await??,
-        rand_hex(),
-    );
-    let ins = st.db.lock().unwrap().execute(
-        "INSERT INTO merchants(email,password_hash,name,webhook_secret) VALUES(?1,?2,?3,?4)",
-        params![email, hash, b.name.trim(), secret],
-    );
-    match ins {
-        Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == ErrorCode::ConstraintViolation => {
-            Err(bad(StatusCode::CONFLICT, "email already registered"))
-        }
-        Err(e) => Err(e.into()),
-        Ok(_) => {
-            let mid = st.db.lock().unwrap().last_insert_rowid();
-            Ok((StatusCode::CREATED, Json(new_session(&st, mid)?)))
-        }
-    }
-}
-
-#[derive(Deserialize)]
-pub struct Login {
-    email: String,
-    password: String,
-}
-
-pub async fn login(
-    State(st): S,
-    ConnectInfo(ip): ConnectInfo<std::net::SocketAddr>,
-    Json(b): Json<Login>,
-) -> R {
-    throttle(&st, ip, &b.email.trim().to_lowercase())?;
-    let row: Option<(i64, String)> = st
-        .db
+    st.db
         .lock()
         .unwrap()
-        .query_row(
-            "SELECT id, password_hash FROM merchants WHERE email=?1",
-            [b.email.trim().to_lowercase()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let phc = row.as_ref().map_or(DUMMY.clone(), |r| r.1.clone());
-    let ok = tokio::task::spawn_blocking(move || check_pw(&b.password, &phc)).await?;
-    match row {
-        Some((mid, _)) if ok => Ok(Json(new_session(&st, mid)?)),
-        _ => Err(bad(StatusCode::UNAUTHORIZED, "invalid email or password")),
-    }
+        .execute("UPDATE merchants SET name=?1 WHERE id=?2", params![n, mid])?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn logout(State(st): S, h: HeaderMap) -> NoBody {
@@ -374,4 +346,18 @@ pub async fn list_deliveries(State(st): S, h: HeaderMap, Query(q): Query<Lim>) -
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Json(v.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn email_and_token() {
+        assert_eq!(norm_email("  A@B.Co "), Some("a@b.co".into()));
+        for bad in ["", "a", "a@b", "@b.co", "a b@c.co", "a@.co", "a@b."] {
+            assert_eq!(norm_email(bad), None, "{bad}");
+        }
+        assert!(ct_eq("abc", "abc") && !ct_eq("abc", "abd") && !ct_eq("abc", "abcd"));
+    }
 }
