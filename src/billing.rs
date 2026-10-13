@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 const MONTH_SECS: i64 = 30 * 86400;
 const CHECKOUT_TTL: i64 = 1800;
+/// A billing invoice paid (mined) later than this after its expiry is `late_paid` and activates nothing.
+const LATE_GRACE: i64 = 3600;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Plan {
@@ -336,7 +338,27 @@ pub fn on_invoice(
 ) -> anyhow::Result<()> {
     match status {
         "paid" => {
-            apply_paid(st, db, "invoice_id", invoice)?;
+            let exp: Option<i64> = db
+                .query_row(
+                    "SELECT i.expires_at FROM subscriptions s JOIN invoices i ON i.id=s.invoice_id WHERE s.invoice_id=?1 AND s.status IN ('pending','expired')",
+                    [invoice],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match exp {
+                // the price was fixed at checkout, so a payment long after expiry does not buy the plan
+                Some(e) if now() > e + LATE_GRACE => {
+                    db.execute(
+                        "UPDATE subscriptions SET status='late_paid', paid_at=?2 WHERE invoice_id=?1 AND status IN ('pending','expired')",
+                        params![invoice, now()],
+                    )?;
+                    tracing::warn!("billing invoice {invoice} paid after the grace period: subscription late_paid, plan unchanged");
+                }
+                Some(_) => {
+                    apply_paid(st, db, "invoice_id", invoice)?;
+                }
+                None => {}
+            }
         }
         "underpaid" | "expired" => {
             db.execute(
@@ -375,6 +397,31 @@ fn plan_updated(st: &Arc<St>, db: &Connection, mid: i64) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // (subscription status, merchant plan, plan.updated events) after a payment `late` s past expiry
+    #[tokio::test]
+    async fn late_billing_payment() {
+        for (late, want) in [
+            (-900, ("paid", "pro", 1)),
+            (LATE_GRACE - 60, ("paid", "pro", 1)),
+            (LATE_GRACE + 60, ("late_paid", "free", 0)),
+        ] {
+            let st = crate::tests::test_st();
+            let db = st.db.lock().unwrap();
+            db.execute("INSERT INTO merchants(id,email,password_hash,name,webhook_url,webhook_secret) VALUES(2,'c@d.co','','','http://127.0.0.1:9/','s')", []).unwrap();
+            db.execute("INSERT INTO invoices(id,merchant_id,div_index,address,amount_zat,status,created_at,expires_at) VALUES('bi',1,0,'a',1,'paid',0,?1)", [now() - late]).unwrap();
+            db.execute("INSERT INTO subscriptions(id,merchant_id,plan,months,price_usd,amount_zat,zec_usd,invoice_id,status,created_at) VALUES('s',2,'pro',1,29,1,50,'bi','expired',0)", []).unwrap();
+            on_invoice(&st, &db, "bi", "paid").unwrap();
+            let got: (String, String, i64) = db
+                .query_row(
+                    "SELECT s.status, m.plan, (SELECT COUNT(*) FROM webhook_events WHERE type='plan.updated') FROM subscriptions s JOIN merchants m ON m.id=s.merchant_id",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!((got.0.as_str(), got.1.as_str(), got.2), want, "late {late}");
+        }
+    }
 
     #[test]
     fn plan_expiry() {
