@@ -82,6 +82,14 @@ Compose:
 
 Put it behind a TLS reverse proxy (Caddy or nginx). Proxy `/v1/invoices/{id}/ws` as a WebSocket (nginx needs the `Upgrade` and `Connection` headers). Block `/v1/auth/exchange` from the public internet.
 
+If the service sits under a path prefix (for example `https://example.com/api`), the proxy must strip the prefix: routes start at `/v1` and `/healthz` (Dokploy/Traefik: enable Strip Path). Clients then use the prefixed base URL without `/v1`.
+
+Common errors:
+- `POST /v1/auth/exchange` -> 503 `internal auth not configured`: `LUNAZ_INTERNAL_TOKEN` is not set on this service.
+- `POST /v1/auth/exchange` -> 401: the token differs from the one the dashboard sends.
+- 404 on every path through the domain: the path prefix is not stripped.
+- The container health turns `healthy` after the first check (30 s interval), even though the server is up within a second.
+
 ## API
 
 JSON; errors are `{"error": ...}`. Session token: `Authorization: Bearer <token>`, valid 30 days. The merchant API uses an API key as the Bearer token.
