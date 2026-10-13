@@ -137,6 +137,10 @@ CREATE TABLE IF NOT EXISTS invoices(id TEXT PRIMARY KEY, merchant_id INTEGER NOT
   expires_at INTEGER NOT NULL, paid_at INTEGER, txid TEXT, UNIQUE(merchant_id, div_index));
 CREATE TABLE IF NOT EXISTS payments(txid TEXT NOT NULL, action_idx INTEGER NOT NULL, invoice_id TEXT NOT NULL,
   value_zat INTEGER NOT NULL, height INTEGER, PRIMARY KEY(txid, action_idx));
+CREATE INDEX IF NOT EXISTS payments_invoice ON payments(invoice_id);
+CREATE INDEX IF NOT EXISTS invoices_merchant ON invoices(merchant_id, created_at);
+CREATE INDEX IF NOT EXISTS invoices_status ON invoices(status);
+CREATE INDEX IF NOT EXISTS api_keys_merchant ON api_keys(merchant_id);
 CREATE TABLE IF NOT EXISTS sync_state(id INTEGER PRIMARY KEY CHECK(id=1), height INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS swaps(id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL, origin_asset TEXT NOT NULL, symbol TEXT NOT NULL, blockchain TEXT NOT NULL,
   deposit_address TEXT NOT NULL, deposit_memo TEXT, amount_in TEXT NOT NULL, amount_in_formatted TEXT NOT NULL, amount_in_usd TEXT, refund_to TEXT NOT NULL,
@@ -201,6 +205,10 @@ fn migrate(db: &Connection, net: &Network) -> rusqlite::Result<()> {
     if n > 0 {
         tracing::info!("converted {n} stored UFVK(s) to UIVK");
     }
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS webhook_deliveries_event ON webhook_deliveries(event_id)",
+        [],
+    )?;
     db.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS merchants_orchard_ivk ON merchants(orchard_ivk_hash)",
         [],
@@ -533,6 +541,24 @@ pub mod tests {
             204
         );
         assert_eq!(call(post, "/v1/invoices", &key, inv).await.0, 401);
+    }
+
+    #[test]
+    fn hot_queries_use_indexes() {
+        let st = test_st();
+        let db = st.db.lk();
+        for q in [
+            "SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id='x' AND height IS NOT NULL",
+            "SELECT id FROM invoices WHERE merchant_id=1 AND created_at>=0 ORDER BY created_at",
+            "SELECT id FROM invoices WHERE status='detected'",
+            "SELECT id FROM webhook_deliveries WHERE event_id='x'",
+            "SELECT COUNT(*) FROM api_keys WHERE merchant_id=1 AND revoked_at IS NULL",
+        ] {
+            let plan: String = db
+                .query_row(&format!("EXPLAIN QUERY PLAN {q}"), [], |r| r.get(3))
+                .unwrap();
+            assert!(plan.contains("USING INDEX") || plan.contains("USING COVERING INDEX"), "{q}: {plan}");
+        }
     }
 
     #[test]
