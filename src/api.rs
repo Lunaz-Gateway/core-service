@@ -41,9 +41,6 @@ impl<E: Into<anyhow::Error>> From<E> for AppErr {
     }
 }
 impl AppErr {
-    pub fn new(c: StatusCode, m: String) -> Self {
-        AppErr(c, m, Value::Null)
-    }
     /// Error with extra top-level JSON fields.
     pub fn with(c: StatusCode, m: String, extra: Value) -> Self {
         AppErr(c, m, extra)

@@ -173,6 +173,21 @@ fn commit(
     Ok(None)
 }
 
+/// Fixed buyer-facing text for a 1Click rejection; the raw message only goes to the log.
+fn quote_error(m: &str) -> &'static str {
+    let m = m.to_lowercase();
+    if m.contains("refund") || m.contains("address") {
+        "refund address is not valid for this asset"
+    } else if ["amount", "too low", "small", "minimum"]
+        .iter()
+        .any(|k| m.contains(k))
+    {
+        "amount is too small to swap with this asset"
+    } else {
+        "swap quote rejected, try another asset or pay in ZEC"
+    }
+}
+
 #[derive(Deserialize)]
 pub struct NewSwap {
     asset_id: String,
@@ -245,12 +260,16 @@ pub async fn create_swap(
     let code = r.status();
     let v: Value = r.json().await.unwrap_or_default();
     if code.is_client_error() {
-        let m = v["message"].as_str().unwrap_or("quote rejected");
-        return Err(AppErr::new(StatusCode::BAD_REQUEST, m.into()));
+        let m = v["message"].as_str().unwrap_or_default();
+        tracing::info!(
+            "quote for invoice {id} rejected: {code} {}",
+            m.replace(refund, "<refund_to>")
+        );
+        return Err(bad(StatusCode::BAD_REQUEST, quote_error(m)));
     }
     let q = &v["quote"];
     let Some(dep) = q["depositAddress"].as_str().filter(|_| code.is_success()) else {
-        tracing::warn!("quote: {code} {v}");
+        tracing::warn!("quote for invoice {id}: unexpected response {code}");
         return Err(bad(StatusCode::BAD_GATEWAY, "swap provider error"));
     };
     let s = |k: &str| q[k].as_str().map(String::from);
@@ -456,6 +475,22 @@ mod tests {
         .unwrap()
         .is_some());
         assert_eq!(swaps(&db).len(), 1);
+    }
+
+    #[test]
+    fn quote_errors_fixed() {
+        assert_eq!(
+            quote_error("refundTo is not valid: 0xdead"),
+            "refund address is not valid for this asset"
+        );
+        assert_eq!(
+            quote_error("Amount is too low for bridge, try at least 1.5"),
+            "amount is too small to swap with this asset"
+        );
+        assert_eq!(
+            quote_error("<script>"),
+            "swap quote rejected, try another asset or pay in ZEC"
+        );
     }
 
     #[test]
