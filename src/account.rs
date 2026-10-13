@@ -1,4 +1,4 @@
-use crate::api::{bad, bearer, parse_ufvk, rand_hex, sha_hex, AppErr, R};
+use crate::api::{bad, bearer, parse_viewing_key, rand_hex, sha_hex, AppErr, R};
 use crate::{now, St};
 use axum::{
     extract::{Path, Query, State},
@@ -140,7 +140,7 @@ pub async fn account(State(st): S, h: HeaderMap) -> R {
     let db = st.db.lock().unwrap();
     let mut v = db.query_row("SELECT id, email, name, ufvk IS NOT NULL, webhook_url FROM merchants WHERE id=?1", [mid], |r| {
         Ok(json!({"id": r.get::<_, i64>(0)?, "email": r.get::<_, String>(1)?, "name": r.get::<_, String>(2)?, "network": net,
-            "ufvk_set": r.get::<_, bool>(3)?, "webhook_url": r.get::<_, Option<String>>(4)?}))
+            "ufvk_set": r.get::<_, bool>(3)?, "viewing_key_set": r.get::<_, bool>(3)?, "webhook_url": r.get::<_, Option<String>>(4)?}))
     })?;
     v["plan"] = crate::billing::plan_of(&st, &db, mid)?.id.clone().into();
     Ok(Json(v))
@@ -148,17 +148,21 @@ pub async fn account(State(st): S, h: HeaderMap) -> R {
 
 #[derive(Deserialize)]
 pub struct SetUfvk {
-    ufvk: String,
+    #[serde(alias = "ufvk")]
+    viewing_key: String,
 }
 
 pub async fn set_ufvk(State(st): S, h: HeaderMap, Json(b): Json<SetUfvk>) -> NoBody {
     let mid = auth(&st, &h)?;
-    parse_ufvk(&st.net, &b.ufvk).map_err(|e| bad(StatusCode::BAD_REQUEST, &e.to_string()))?;
+    // Only the incoming key is stored (a UFVK is reduced to its UIVK).
+    let uivk = parse_viewing_key(&st.net, &b.viewing_key)
+        .map_err(|e| bad(StatusCode::BAD_REQUEST, &e.to_string()))?
+        .encode(&st.net);
     // Conditional update keeps set-once atomic.
-    // Two accounts sharing a UFVK would derive identical invoice addresses.
+    // Two accounts sharing a viewing key would derive identical invoice addresses.
     let n = match st.db.lock().unwrap().execute(
         "UPDATE merchants SET ufvk=?1 WHERE id=?2 AND ufvk IS NULL",
-        params![b.ufvk, mid],
+        params![uivk, mid],
     ) {
         Err(rusqlite::Error::SqliteFailure(e, _))
             if e.code == rusqlite::ErrorCode::ConstraintViolation =>

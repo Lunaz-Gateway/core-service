@@ -1,7 +1,7 @@
 use crate::{now, St};
 use anyhow::Result;
 use orchard::{
-    keys::{IncomingViewingKey, PreparedIncomingViewingKey, Scope},
+    keys::{IncomingViewingKey, PreparedIncomingViewingKey},
     note_encryption::{CompactAction, IronwoodDomain, OrchardDomain},
 };
 use rusqlite::{params, Connection, OptionalExtension};
@@ -32,10 +32,10 @@ fn keys(st: &St) -> Result<Vec<Key>> {
     let mut out = vec![];
     for r in rows {
         let (merchant, ufvk) = r?;
-        let ivk = crate::api::parse_ufvk(&st.net, &ufvk)?
+        let ivk = crate::api::parse_viewing_key(&st.net, &ufvk)?
             .orchard()
-            .unwrap()
-            .to_ivk(Scope::External);
+            .clone()
+            .unwrap();
         out.push(Key {
             merchant,
             pivk: PreparedIncomingViewingKey::new(&ivk),

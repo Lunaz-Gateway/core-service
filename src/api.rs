@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use zcash_address::ZcashAddress;
-use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey};
+use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedIncomingViewingKey};
 use zcash_protocol::{consensus::Network, memo::MemoBytes, value::Zatoshis};
 use zip32::DiversifierIndex;
 use zip321::{Payment, TransactionRequest};
@@ -67,19 +67,43 @@ pub fn sha_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
-pub fn parse_ufvk(net: &Network, s: &str) -> anyhow::Result<UnifiedFullViewingKey> {
-    let u =
-        UnifiedFullViewingKey::decode(net, s).map_err(|e| anyhow::anyhow!("invalid ufvk: {e}"))?;
-    anyhow::ensure!(u.orchard().is_some(), "ufvk has no orchard component");
+fn decode_vk(net: &Network, s: &str) -> Option<UnifiedIncomingViewingKey> {
+    UnifiedFullViewingKey::decode(net, s)
+        .map(|u| u.to_unified_incoming_viewing_key())
+        .ok()
+        .or_else(|| UnifiedIncomingViewingKey::decode(net, s).ok())
+}
+
+/// Accepts a UIVK or UFVK; a UFVK is reduced to its incoming key.
+pub fn parse_viewing_key(net: &Network, s: &str) -> anyhow::Result<UnifiedIncomingViewingKey> {
+    let s = s.trim();
+    let Some(u) = decode_vk(net, s) else {
+        let other = match net {
+            Network::MainNetwork => Network::TestNetwork,
+            _ => Network::MainNetwork,
+        };
+        if decode_vk(&other, s).is_some() {
+            anyhow::bail!("viewing key is for a different network");
+        }
+        anyhow::bail!("invalid viewing key: expected a unified incoming viewing key (uivk…) or full viewing key (uview…)");
+    };
+    anyhow::ensure!(
+        u.orchard().is_some(),
+        "viewing key has no Orchard component"
+    );
     Ok(u)
 }
 
 // Invoice addresses live far above the low indices the merchant's own wallet hands out.
 pub const INDEX_BASE: u128 = 1 << 80;
 
-fn invoice_address(net: &Network, ufvk: &UnifiedFullViewingKey, n: u64) -> anyhow::Result<String> {
+fn invoice_address(
+    net: &Network,
+    uivk: &UnifiedIncomingViewingKey,
+    n: u64,
+) -> anyhow::Result<String> {
     let idx = DiversifierIndex::try_from(INDEX_BASE + n as u128)?;
-    Ok(ufvk
+    Ok(uivk
         .address(idx, UnifiedAddressRequest::ORCHARD)?
         .encode(net))
 }
@@ -143,7 +167,7 @@ pub fn new_invoice(
         )
         .optional()?
         .ok_or_else(|| bad(StatusCode::BAD_REQUEST, "viewing key not set"))?;
-    let address = invoice_address(&st.net, &parse_ufvk(&st.net, &ufvk)?, idx)?;
+    let address = invoice_address(&st.net, &parse_viewing_key(&st.net, &ufvk)?, idx)?;
     let uri = zip321_uri(
         &address,
         amount,
@@ -236,23 +260,26 @@ async fn watch(st: Arc<St>, id: String, mut sock: WebSocket) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchard::keys::Scope;
     use zcash_keys::keys::UnifiedSpendingKey;
     use zip32::AccountId;
+
+    fn fvk(net: &Network, seed: u8) -> UnifiedFullViewingKey {
+        UnifiedSpendingKey::from_seed(net, &[seed; 32], AccountId::ZERO)
+            .unwrap()
+            .to_unified_full_viewing_key()
+    }
 
     #[test]
     fn address_roundtrip() {
         let net = Network::TestNetwork;
-        let usk = UnifiedSpendingKey::from_seed(&net, &[7u8; 32], AccountId::ZERO).unwrap();
-        let s = usk.to_unified_full_viewing_key().encode(&net);
-        println!("UFVK={s}");
-        let ufvk = parse_ufvk(&net, &s).unwrap();
-        let addr = invoice_address(&net, &ufvk, 5).unwrap();
+        let ufvk = fvk(&net, 7);
+        let uivk = parse_viewing_key(&net, &ufvk.encode(&net)).unwrap();
+        let addr = invoice_address(&net, &uivk, 5).unwrap();
         let ua = match zcash_keys::address::Address::decode(&net, &addr).unwrap() {
             zcash_keys::address::Address::Unified(u) => u,
             _ => panic!(),
         };
-        let ivk = ufvk.orchard().unwrap().to_ivk(Scope::External);
+        let ivk = uivk.orchard().as_ref().unwrap();
         assert_eq!(
             u128::from(ivk.diversifier_index(ua.orchard().unwrap()).unwrap()),
             INDEX_BASE + 5
@@ -266,5 +293,40 @@ mod tests {
         assert!(zip321_uri(&addr, 1000, "lunaz:x")
             .unwrap()
             .starts_with("zcash:utest"));
+    }
+
+    #[test]
+    fn ufvk_and_uivk_derive_same_addresses() {
+        for net in [Network::TestNetwork, Network::MainNetwork] {
+            let ufvk = fvk(&net, 9);
+            let uivk = ufvk.to_unified_incoming_viewing_key();
+            let parsed = parse_viewing_key(&net, &uivk.encode(&net)).unwrap();
+            assert_eq!(parsed.encode(&net), uivk.encode(&net));
+            assert_eq!(
+                parse_viewing_key(&net, &ufvk.encode(&net))
+                    .unwrap()
+                    .encode(&net),
+                uivk.encode(&net)
+            );
+            for n in [0u64, 1, 5, 1000, u32::MAX as u64] {
+                let idx = DiversifierIndex::try_from(INDEX_BASE + n as u128).unwrap();
+                let from_ufvk = ufvk
+                    .address(idx, UnifiedAddressRequest::ORCHARD)
+                    .unwrap()
+                    .encode(&net);
+                assert_eq!(from_ufvk, invoice_address(&net, &parsed, n).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_bad_keys() {
+        let (t, m) = (Network::TestNetwork, Network::MainNetwork);
+        let uivk = fvk(&t, 3).to_unified_incoming_viewing_key().encode(&t);
+        let e = |net, s: &str| parse_viewing_key(net, s).unwrap_err().to_string();
+        assert!(uivk.starts_with("uivktest"));
+        assert!(e(&m, &uivk).contains("different network"));
+        assert!(e(&m, &fvk(&t, 3).encode(&t)).contains("different network"));
+        assert!(e(&t, "garbage").starts_with("invalid viewing key"));
     }
 }

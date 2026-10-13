@@ -48,6 +48,7 @@ pub fn app(st: Arc<St>) -> Router {
         .route("/v1/auth/exchange", post(account::exchange))
         .route("/v1/account", get(account::account).put(account::set_name))
         .route("/v1/account/ufvk", put(account::set_ufvk))
+        .route("/v1/account/viewing-key", put(account::set_ufvk))
         .route(
             "/v1/account/api-keys",
             get(account::list_keys).post(account::create_key),
@@ -125,7 +126,7 @@ CREATE INDEX IF NOT EXISTS subscriptions_invoice ON subscriptions(invoice_id);
 CREATE INDEX IF NOT EXISTS subscriptions_merchant ON subscriptions(merchant_id, created_at);";
 
 /// Idempotent column additions for databases created by older versions.
-fn migrate(db: &Connection) -> rusqlite::Result<()> {
+fn migrate(db: &Connection, net: &Network) -> rusqlite::Result<()> {
     for (table, col, ddl) in [
         ("invoices", "paid_usd_rate", "REAL"),
         ("merchants", "plan", "TEXT NOT NULL DEFAULT 'free'"),
@@ -139,6 +140,27 @@ fn migrate(db: &Connection) -> rusqlite::Result<()> {
         if !has {
             db.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {ddl}"), [])?;
         }
+    }
+    // merchants.ufvk now holds the UIVK; reduce any stored UFVK in place.
+    let rows: Vec<(i64, String)> = db
+        .prepare("SELECT id, ufvk FROM merchants WHERE ufvk LIKE 'uview%'")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut n = 0;
+    for (id, k) in rows {
+        match api::parse_viewing_key(net, &k) {
+            Ok(u) => {
+                db.execute(
+                    "UPDATE merchants SET ufvk=?1 WHERE id=?2",
+                    rusqlite::params![u.encode(net), id],
+                )?;
+                n += 1;
+            }
+            Err(e) => tracing::warn!("merchant {id}: viewing key not converted: {e}"),
+        }
+    }
+    if n > 0 {
+        tracing::info!("converted {n} stored UFVK(s) to UIVK");
     }
     Ok(())
 }
@@ -173,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let db = Connection::open(env("LUNAZ_DB").unwrap_or("lunaz.db".into()))?;
     db.execute_batch(SCHEMA)?;
-    migrate(&db)?;
+    migrate(&db, &net)?;
     let st = Arc::new(St {
         db: Mutex::new(db),
         net,
@@ -227,7 +249,7 @@ pub mod tests {
     pub fn test_st() -> Arc<St> {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(SCHEMA).unwrap();
-        migrate(&db).unwrap();
+        migrate(&db, &Network::TestNetwork).unwrap();
         Arc::new(St {
             db: Mutex::new(db),
             net: Network::TestNetwork,
@@ -320,6 +342,31 @@ pub mod tests {
             .0,
             204
         );
+        // Same wallet as a UIVK on another account is a duplicate.
+        let uivk = UnifiedSpendingKey::from_seed(&net, &[7u8; 32], AccountId::ZERO)
+            .unwrap()
+            .to_unified_full_viewing_key()
+            .to_unified_incoming_viewing_key()
+            .encode(&net);
+        let (_, v3) = call(
+            post.clone(),
+            "/v1/auth/exchange",
+            &it,
+            json!({"email": "c@d.co"}),
+        )
+        .await;
+        let tok2 = v3["token"].as_str().unwrap().to_string();
+        assert_eq!(
+            call(
+                reqwest::Method::PUT,
+                "/v1/account/viewing-key",
+                &tok2,
+                json!({"viewing_key": uivk})
+            )
+            .await
+            .0,
+            409
+        );
         assert_eq!(
             call(post.clone(), "/v1/invoices", &key, inv.clone())
                 .await
@@ -338,5 +385,27 @@ pub mod tests {
             204
         );
         assert_eq!(call(post, "/v1/invoices", &key, inv).await.0, 401);
+    }
+
+    #[test]
+    fn migrate_converts_ufvk_once() {
+        let net = Network::TestNetwork;
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        let fvk = UnifiedSpendingKey::from_seed(&net, &[1u8; 32], AccountId::ZERO)
+            .unwrap()
+            .to_unified_full_viewing_key();
+        db.execute(
+            "INSERT INTO merchants(email,password_hash,name,ufvk,webhook_secret) VALUES('a','','',?1,'')",
+            [fvk.encode(&net)],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            migrate(&db, &net).unwrap();
+            let k: String = db
+                .query_row("SELECT ufvk FROM merchants", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(k, fvk.to_unified_incoming_viewing_key().encode(&net));
+        }
     }
 }
