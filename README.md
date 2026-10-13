@@ -17,27 +17,33 @@ Non-custodial shielded Zcash payment gateway. Merchants sign up, register a Unif
 - Cross-chain payments: the origin-chain leg is public. Only the final shielded leg is private.
 - Passwords are hashed with Argon2id. Session tokens and API keys are stored as hashes. API keys (`lz_...`) can create invoices only. The viewing key can be set once.
 - The invoice id is the capability for the public endpoints (`GET /v1/invoices/{id}`, WebSocket, swap).
+- Webhooks are sent only to public addresses over https, without following redirects, and report coarse errors only (see Webhooks), so they cannot be used to probe the internal network.
+- Received amounts count mined payments only; unconfirmed ones are reported separately as `pending_zat`.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LUNAZ_NETWORK` | `test` (Docker image: `main`) | `test` or `main`; anything else aborts startup |
+| `LUNAZ_NETWORK` | `test` (Docker image: `main`) | `test` or `main`; anything else aborts startup. The default stays `test` so a bare `cargo run` never touches real funds; production sets `main` explicitly |
 | `LUNAZ_LWD_URL` | `https://zec.rocks:443` (main), `https://testnet.zec.rocks:443` (test) | lightwalletd endpoint |
 | `LUNAZ_DB` | `lunaz.db` (Docker image: `/data/lunaz.db`) | SQLite path |
-| `LUNAZ_BIND` | `0.0.0.0:8080` | listen address |
+| `LUNAZ_BIND` | `127.0.0.1:8080` (Docker image: `0.0.0.0:8080`) | listen address |
 | `LUNAZ_ONECLICK_JWT` | unset | 1Click token; without it 1Click adds a 0.25% fee |
 | `LUNAZ_OFFRAMP` | `mock` | off-ramp provider: `mock` or `transfi` (not implemented yet: off-ramp requests return 501) |
 | `LUNAZ_MOCK_FX` | `{"IDR":16400,"USD":1}` | mock only: USD -> fiat rates (indicative), also defines the supported currencies |
-| `LUNAZ_MOCK_ZEC_USD` | unset | mock only: fixed ZEC/USD price instead of the 1Click price |
+| `LUNAZ_MOCK_ZEC_USD` | unset | mock off-ramp only (ignored otherwise): fixed ZEC/USD price instead of the 1Click price, also the billing fallback price |
 | `LUNAZ_PLANS` | built-in table below | JSON array `[{id,name,price_usd,invoices_per_month,api_keys}]` replacing the plans (`null` = unlimited / not purchasable); must include `free` |
 | `LUNAZ_INTERNAL_TOKEN` | unset | secret (>=32 chars) for `/v1/auth/exchange`; unset = endpoint returns 503; shorter aborts startup |
 | `LUNAZ_BILLING_MERCHANT_ID` | unset | id of the treasury merchant that receives subscription payments; unset = purchase endpoints return 503 `billing not configured` |
 | `LUNAZ_BILLING_SANDBOX` | unset | `1` enables `simulate-paid` (demos/tests) |
+| `LUNAZ_DEV` | unset | `1` marks a local development instance: allows the dev options below on mainnet and logs a WARN listing them |
+| `LUNAZ_ALLOW_MOCK_ON_MAINNET` | unset | `1` allows the mock off-ramp on mainnet without `LUNAZ_DEV` |
 | `LUNAZ_WEBHOOK_ALLOW_HTTP` | unset | `1` also accepts plain `http://` webhook URLs (still public hosts, default port) |
 | `LUNAZ_WEBHOOK_ALLOW_PRIVATE` | unset | development only: `1` allows webhooks to private/loopback addresses, any port, `http` |
 | `LUNAZ_MAX_WS` | `2000` | maximum concurrent invoice WebSockets |
 | `RUST_LOG` | tracing default | log filter |
+
+Mainnet guards: with `LUNAZ_NETWORK=main` the service refuses to start when `LUNAZ_BILLING_SANDBOX` is on, when the off-ramp is `mock` (the default) without `LUNAZ_ALLOW_MOCK_ON_MAINNET=1`, or when `LUNAZ_WEBHOOK_ALLOW_PRIVATE` is on, unless `LUNAZ_DEV=1` is set. Boolean variables accept `1`, `true`, `yes` or `on`.
 
 ## Run locally
 
@@ -54,7 +60,7 @@ The image is multi-stage: Rust build, then `gcr.io/distroless/cc-debian12:nonroo
     docker build -t lunaz-core .
     docker run -d --name lunaz-core --read-only --tmpfs /tmp --cap-drop ALL \
       --security-opt no-new-privileges:true --pids-limit 256 --memory 512m \
-      -p 127.0.0.1:8080:8080 -v lunaz-data:/data -e LUNAZ_NETWORK=main \
+      -p 127.0.0.1:8080:8080 -v lunaz-data:/data -e LUNAZ_NETWORK=main -e LUNAZ_OFFRAMP=transfi \
       --restart unless-stopped lunaz-core
 
 Compose:
@@ -73,6 +79,7 @@ Compose:
         volumes: ["lunaz-data:/data"]
         environment:
           LUNAZ_NETWORK: main
+          LUNAZ_OFFRAMP: transfi
         restart: unless-stopped
         healthcheck:
           test: ["CMD", "/lunaz-core", "healthcheck"]
@@ -186,7 +193,7 @@ All features are on every plan; only volume is limited. Existing merchants are o
 
 - Limits: `POST /v1/invoices` counts invoices created in the current UTC calendar month (billing invoices excluded); `POST /v1/account/api-keys` counts active keys. Over the limit -> 402 `{error, limit, used, plan}`.
 - A plan is effective until `plan_expires_at`; after that the merchant is on `free`. The 10 s sweep resets the stored plan and sends the `plan.updated` webhook `{type, invoice_id: null, plan, expires_at}`.
-- ZEC billing is dogfooded: the treasury (`LUNAZ_BILLING_MERCHANT_ID`) is an ordinary Lunaz merchant with a viewing key. A checkout creates a normal invoice on it (memo `lunaz:billing:<subscription id>`, 30 min), priced `ceil(price_usd * months / zec_usd * 1e8)` zat with the cached 1Click ZEC price (`LUNAZ_MOCK_ZEC_USD` as fallback; 503 without a price). The invoice is public like any other (`GET /v1/invoices/{id}`, WebSocket).
+- ZEC billing is dogfooded: the treasury (`LUNAZ_BILLING_MERCHANT_ID`) is an ordinary Lunaz merchant with a viewing key. A checkout creates a normal invoice on it (memo `lunaz:billing:<subscription id>`, 30 min), priced `ceil(price_usd * months / zec_usd * 1e8)` zat with the cached 1Click ZEC price (`LUNAZ_MOCK_ZEC_USD` as fallback with the mock off-ramp only; 503 without a price). The invoice is public like any other (`GET /v1/invoices/{id}`, WebSocket).
 - When that invoice turns `paid` the subscription is paid, the plan runs for `months * 30` days from `max(now, current expiry)` if it is the same still-active plan, otherwise from now. Underpaid or expired -> subscription `expired` (a late top-up to the full amount still activates it).
 - No proration: switching to another paid plan starts the new plan now and replaces the old one. Renewals are manual payments; nothing is charged automatically.
 - `GET /v1/plans` (public) -> `[{id, name, price_usd, invoices_per_month, api_keys}]`

@@ -46,7 +46,9 @@ impl Cfg {
             provider,
             fx: serde_json::from_str(&fx)
                 .map_err(|e| anyhow::anyhow!("LUNAZ_MOCK_FX invalid: {e}"))?,
-            zec_usd: env("LUNAZ_MOCK_ZEC_USD").and_then(|v| v.parse().ok()),
+            zec_usd: env("LUNAZ_MOCK_ZEC_USD")
+                .and_then(|v| v.parse().ok())
+                .filter(|_| provider == Provider::Mock),
         })
     }
 }
@@ -133,8 +135,8 @@ pub fn calc(amount: u64, cur: &str, zec_usd: f64, fx: f64, t: i64) -> Quote {
 
 async fn zec_usd(st: &St) -> Option<f64> {
     match st.off.zec_usd {
-        Some(p) if st.off.provider == Provider::Mock => Some(p),
-        _ => crate::swap::zec_price(st).await,
+        Some(p) => Some(p),
+        None => crate::swap::zec_price(st).await,
     }
 }
 

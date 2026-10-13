@@ -201,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
     let env = |k: &str| std::env::var(k).ok();
     // Hidden subcommand for container HEALTHCHECK (distroless has no curl).
     if std::env::args().nth(1).as_deref() == Some("healthcheck") {
-        let port = env("LUNAZ_BIND").unwrap_or("0.0.0.0:8080".into());
+        let port = env("LUNAZ_BIND").unwrap_or("127.0.0.1:8080".into());
         let port = port.rsplit(':').next().unwrap_or("8080").to_string();
         let ok = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{port}/healthz"))
@@ -224,6 +224,23 @@ async fn main() -> anyhow::Result<()> {
     if allow_private {
         tracing::warn!("LUNAZ_WEBHOOK_ALLOW_PRIVATE is on: webhooks may target private and loopback addresses (development only)");
     }
+    let (off, bill) = (offramp::Cfg::from_env(env)?, billing::Cfg::from_env(env)?);
+    let opts = dev_options(&env, off.provider == offramp::Provider::Mock);
+    if truthy(env("LUNAZ_DEV")) {
+        tracing::warn!(
+            "LUNAZ_DEV=1: development mode, NOT for production; dev options enabled: {}",
+            if opts.is_empty() {
+                "none".into()
+            } else {
+                opts.join(", ")
+            }
+        );
+    } else if matches!(net, Network::MainNetwork) && !opts.is_empty() {
+        anyhow::bail!(
+            "refusing to start on mainnet with development options: {} (set LUNAZ_DEV=1 for a local dev instance; LUNAZ_ALLOW_MOCK_ON_MAINNET=1 allows only the mock off-ramp)",
+            opts.join(", ")
+        );
+    }
     let db = Connection::open(env("LUNAZ_DB").unwrap_or("lunaz.db".into()))?;
     db.execute_batch(SCHEMA)?;
     migrate(&db, &net)?;
@@ -239,8 +256,8 @@ async fn main() -> anyhow::Result<()> {
         assets: Mutex::new(None),
         limits: Default::default(),
         zec_price: Mutex::new(None),
-        off: offramp::Cfg::from_env(env)?,
-        bill: billing::Cfg::from_env(env)?,
+        off,
+        bill,
         internal,
         hook: hook::Cfg::new(allow_private, truthy(env("LUNAZ_WEBHOOK_ALLOW_HTTP")))?,
         ws: Arc::new(tokio::sync::Semaphore::new(
@@ -257,7 +274,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(hook::run(st.clone()));
 
     let app = app(st);
-    let bind = env("LUNAZ_BIND").unwrap_or("0.0.0.0:8080".into());
+    let bind = env("LUNAZ_BIND").unwrap_or("127.0.0.1:8080".into());
     tracing::info!("listening on {bind}");
     axum::serve(
         tokio::net::TcpListener::bind(bind).await?,
@@ -266,6 +283,25 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown())
     .await?;
     Ok(())
+}
+
+/// Development-only options in effect; mainnet refuses them unless LUNAZ_DEV=1.
+fn dev_options(env: &impl Fn(&str) -> Option<String>, mock_offramp: bool) -> Vec<&'static str> {
+    let on = |k| truthy(env(k));
+    [
+        (on("LUNAZ_BILLING_SANDBOX"), "LUNAZ_BILLING_SANDBOX"),
+        (
+            mock_offramp && !on("LUNAZ_ALLOW_MOCK_ON_MAINNET"),
+            "LUNAZ_OFFRAMP=mock",
+        ),
+        (
+            on("LUNAZ_WEBHOOK_ALLOW_PRIVATE"),
+            "LUNAZ_WEBHOOK_ALLOW_PRIVATE",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect()
 }
 
 /// Resolves on ctrl-c or SIGTERM (docker stop).
@@ -427,6 +463,27 @@ pub mod tests {
             204
         );
         assert_eq!(call(post, "/v1/invoices", &key, inv).await.0, 401);
+    }
+
+    #[test]
+    fn dev_options_listed() {
+        let e = |kv: &'static [(&'static str, &'static str)]| {
+            move |k: &str| kv.iter().find(|(a, _)| *a == k).map(|(_, v)| v.to_string())
+        };
+        assert!(dev_options(&e(&[]), false).is_empty());
+        assert_eq!(dev_options(&e(&[]), true), ["LUNAZ_OFFRAMP=mock"]);
+        assert!(dev_options(&e(&[("LUNAZ_ALLOW_MOCK_ON_MAINNET", "1")]), true).is_empty());
+        assert_eq!(
+            dev_options(
+                &e(&[
+                    ("LUNAZ_BILLING_SANDBOX", "true"),
+                    ("LUNAZ_WEBHOOK_ALLOW_PRIVATE", "1")
+                ]),
+                false
+            ),
+            ["LUNAZ_BILLING_SANDBOX", "LUNAZ_WEBHOOK_ALLOW_PRIVATE"]
+        );
+        assert!(dev_options(&e(&[("LUNAZ_BILLING_SANDBOX", "0")]), false).is_empty());
     }
 
     #[test]

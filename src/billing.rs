@@ -65,7 +65,7 @@ impl Cfg {
         Ok(Cfg {
             plans,
             merchant: env("LUNAZ_BILLING_MERCHANT_ID").and_then(|v| v.parse().ok()),
-            sandbox: env("LUNAZ_BILLING_SANDBOX").as_deref() == Some("1"),
+            sandbox: crate::truthy(env("LUNAZ_BILLING_SANDBOX")),
         })
     }
 }
