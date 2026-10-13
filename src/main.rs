@@ -9,6 +9,10 @@ mod swap;
 mod watcher;
 
 use axum::{
+    extract::{DefaultBodyLimit, Request},
+    http::{header, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Router,
 };
@@ -123,8 +127,45 @@ pub fn app(st: Arc<St>) -> Router {
         .route("/v1/invoices/{id}", get(api::get_invoice))
         .route("/v1/invoices/{id}/swap", post(swap::create_swap))
         .route("/v1/swap/assets", get(swap::list_assets))
+        .layer(middleware::from_fn(timeout))
+        // no timeout for the long-lived WebSocket
         .route("/v1/invoices/{id}/ws", get(api::invoice_ws))
+        .layer(middleware::from_fn(security_headers))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(st)
+}
+
+const MAX_BODY: usize = 64 * 1024;
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+async fn timeout(req: Request, next: Next) -> Response {
+    tokio::time::timeout(REQUEST_TIMEOUT, next.run(req))
+        .await
+        .unwrap_or_else(|_| {
+            api::bad(StatusCode::SERVICE_UNAVAILABLE, "request timed out").into_response()
+        })
+}
+
+/// Hardening headers; everything but the public static-ish lists is no-store.
+async fn security_headers(req: Request, next: Next) -> Response {
+    let cacheable = req.method() == Method::GET
+        && matches!(
+            req.uri().path(),
+            "/healthz" | "/v1/plans" | "/v1/swap/assets"
+        );
+    let mut r = next.run(req).await;
+    let h = r.headers_mut();
+    for (k, v) in [
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::REFERRER_POLICY, "no-referrer"),
+        (header::X_FRAME_OPTIONS, "DENY"),
+    ] {
+        h.insert(k, HeaderValue::from_static(v));
+    }
+    if !cacheable {
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    r
 }
 
 const SCHEMA: &str = "
@@ -530,12 +571,53 @@ pub mod tests {
             (s, v["error"].as_str()),
             (409, Some("viewing key is already used by another account"))
         );
+        // 60 per minute per key; the 400 above counted as one
+        for i in 0..59 {
+            assert_eq!(
+                call(post.clone(), "/v1/invoices", &key, inv.clone())
+                    .await
+                    .0,
+                200,
+                "invoice {i}"
+            );
+        }
+        let (s, v) = call(post.clone(), "/v1/invoices", &key, inv.clone()).await;
         assert_eq!(
-            call(post.clone(), "/v1/invoices", &key, inv.clone())
-                .await
-                .0,
-            200
+            (s, v["error"].as_str()),
+            (
+                429,
+                Some("too many invoices for this api key, try again in a minute")
+            )
         );
+        // body limit
+        let big = json!({"amount_zat": 1, "pad": "x".repeat(MAX_BODY)});
+        assert_eq!(call(post.clone(), "/v1/invoices", &key, big).await.0, 413);
+        // security headers
+        let r = c
+            .get(format!("{base}/v1/account"))
+            .bearer_auth(&tok)
+            .send()
+            .await
+            .unwrap();
+        let hv = |r: &reqwest::Response, k: &str| {
+            r.headers().get(k).map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(hv(&r, "cache-control").as_deref(), Some("no-store"));
+        assert_eq!(hv(&r, "x-content-type-options").as_deref(), Some("nosniff"));
+        assert_eq!(hv(&r, "x-frame-options").as_deref(), Some("DENY"));
+        assert_eq!(hv(&r, "referrer-policy").as_deref(), Some("no-referrer"));
+        let r = c.get(format!("{base}/healthz")).send().await.unwrap();
+        assert_eq!(hv(&r, "cache-control"), None);
+        assert_eq!(hv(&r, "x-content-type-options").as_deref(), Some("nosniff"));
+        // input limits
+        let (s, _) = call(
+            post.clone(),
+            "/v1/account/api-keys",
+            &tok,
+            json!({"name": "k".repeat(81)}),
+        )
+        .await;
+        assert_eq!(s, 400);
         assert_eq!(
             call(
                 reqwest::Method::DELETE,
