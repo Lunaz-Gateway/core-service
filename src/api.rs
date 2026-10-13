@@ -196,8 +196,9 @@ pub async fn get_invoice(State(st): State<Arc<St>>, Path(id): Path<String>) -> R
     let db = st.db.lock().unwrap();
     let mut v = db
         .query_row(
-            "SELECT status, amount_zat, expires_at, txid, (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id), address,
-             (SELECT 'lunaz:billing:' || id FROM subscriptions WHERE invoice_id=invoices.id)
+            "SELECT status, amount_zat, expires_at, txid, (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id AND height IS NOT NULL), address,
+             (SELECT 'lunaz:billing:' || id FROM subscriptions WHERE invoice_id=invoices.id),
+             (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id AND height IS NULL)
              FROM invoices WHERE id=?1",
             [&id],
             |r| {
@@ -205,7 +206,7 @@ pub async fn get_invoice(State(st): State<Arc<St>>, Path(id): Path<String>) -> R
                 let memo = r.get::<_, Option<String>>(6)?.unwrap_or(format!("lunaz:{id}"));
                 let uri = zip321_uri(&address, amount as u64, &memo).ok();
                 Ok(json!({"id": id, "status": r.get::<_, String>(0)?, "amount_zat": amount, "address": address, "zip321_uri": uri,
-                    "expires_at": r.get::<_, i64>(2)?, "txid": r.get::<_, Option<String>>(3)?, "received_zat": r.get::<_, i64>(4)?, "overpaid_zat": (r.get::<_, i64>(4)? - amount).max(0)}))
+                    "expires_at": r.get::<_, i64>(2)?, "txid": r.get::<_, Option<String>>(3)?, "received_zat": r.get::<_, i64>(4)?, "pending_zat": r.get::<_, i64>(7)?, "overpaid_zat": (r.get::<_, i64>(4)? - amount).max(0)}))
             },
         )
         .optional()?

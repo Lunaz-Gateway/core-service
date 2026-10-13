@@ -94,6 +94,11 @@ fn expire(st: &Arc<St>) {
 // Re-evaluates detected invoices: expiry turns them underpaid, or expired if never mined.
 fn sweep(st: &Arc<St>) {
     let db = st.db.lock().unwrap();
+    // An unmined payment not mined within the hour was most likely dropped.
+    let _ = db.execute(
+        "DELETE FROM payments WHERE height IS NULL AND COALESCE(seen_at,0)<?1",
+        [now() - DROPPED_AFTER],
+    );
     let ids: Vec<String> = db
         .prepare("SELECT id FROM invoices WHERE status='detected'")
         .and_then(|mut q| q.query_map([], |r| r.get(0))?.collect())
@@ -264,20 +269,23 @@ fn record(
         return Ok(());
     };
     let db = st.db.lock().unwrap();
-    let Some(id) = db
+    let Some((id, status)) = db
         .query_row(
-            "SELECT id FROM invoices WHERE merchant_id=?1 AND div_index=?2",
+            "SELECT id, status FROM invoices WHERE merchant_id=?1 AND div_index=?2",
             params![merchant, div],
-            |r| r.get::<_, String>(0),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )
         .optional()?
     else {
         return Ok(());
     };
+    if height.is_none() && is_final(&status) {
+        return Ok(());
+    }
     db.execute(
-        "INSERT INTO payments(txid,action_idx,invoice_id,value_zat,height) VALUES(?1,?2,?3,?4,?5)
+        "INSERT INTO payments(txid,action_idx,invoice_id,value_zat,height,seen_at) VALUES(?1,?2,?3,?4,?5,?6)
          ON CONFLICT(txid,action_idx) DO UPDATE SET height=COALESCE(excluded.height, height)",
-        params![txid, idx, id, value, height],
+        params![txid, idx, id, value, height, now()],
     )?;
     transition(st, &db, &id, Some(txid))
 }
@@ -320,10 +328,16 @@ fn transition(st: &Arc<St>, db: &Connection, id: &str, txid: Option<&str>) -> Re
         return Ok(());
     };
     db.execute(
-        "UPDATE invoices SET status=?1, txid=COALESCE(?2, txid, (SELECT txid FROM payments WHERE invoice_id=?4 ORDER BY height IS NULL, height DESC LIMIT 1)),
+        "UPDATE invoices SET status=?1, txid=COALESCE(?2, (SELECT txid FROM payments WHERE invoice_id=?4 AND height IS NOT NULL ORDER BY height DESC LIMIT 1), txid),
          paid_at=CASE WHEN ?1='paid' THEN ?3 ELSE paid_at END WHERE id=?4",
         params![new, txid, now(), id],
     )?;
+    if is_final(new) {
+        db.execute(
+            "DELETE FROM payments WHERE invoice_id=?1 AND height IS NULL",
+            [id],
+        )?;
+    }
     tracing::info!("invoice {id} -> {new} ({received}/{amount} zat)");
     if matches!(new, "paid" | "underpaid") {
         // Rate lookup must never block the transition, so it runs detached.
@@ -345,6 +359,10 @@ fn transition(st: &Arc<St>, db: &Connection, id: &str, txid: Option<&str>) -> Re
     }
     crate::billing::on_invoice(st, db, id, new)?;
     Ok(())
+}
+
+fn is_final(status: &str) -> bool {
+    matches!(status, "paid" | "underpaid" | "expired")
 }
 
 fn hook_type(status: &str) -> Option<&'static str> {
@@ -475,6 +493,70 @@ mod tests {
         assert_eq!(status(&st), "paid");
     }
 
+    async fn amounts(st: &Arc<St>) -> (i64, i64, i64) {
+        let v = crate::api::get_invoice(
+            axum::extract::State(st.clone()),
+            axum::extract::Path("inv".into()),
+        )
+        .await
+        .ok()
+        .unwrap()
+        .0;
+        let n = |k: &str| v[k].as_i64().unwrap();
+        (n("received_zat"), n("pending_zat"), n("overpaid_zat"))
+    }
+
+    // A dropped mempool tx plus the conflicting mined one must not count twice.
+    #[tokio::test]
+    async fn dropped_mempool_not_counted() {
+        let st = crate::tests::test_st();
+        let (url, got) = receiver().await;
+        setup(&st, &url, 100_000, now() + 900);
+        record(&st, 1, D, "txA", 0, 100_000, None).unwrap();
+        record(&st, 1, D, "txC", 0, 30_000, None).unwrap();
+        assert_eq!(status(&st), "detected");
+        assert_eq!(amounts(&st).await, (0, 130_000, 0));
+        st.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE payments SET seen_at=?1 WHERE txid='txC'",
+                [now() - 7200],
+            )
+            .unwrap();
+        sweep(&st); // stale unmined row is dropped
+        assert_eq!(
+            (status(&st).as_str(), amounts(&st).await),
+            ("detected", (0, 100_000, 0))
+        );
+        record(&st, 1, D, "txB", 0, 100_000, Some(7)).unwrap();
+        assert_eq!(status(&st), "paid");
+        assert_eq!(amounts(&st).await, (100_000, 0, 0)); // final: unmined rows removed
+        record(&st, 1, D, "txA", 0, 100_000, None).unwrap(); // re-seen in mempool
+        assert_eq!(amounts(&st).await, (100_000, 0, 0));
+        wait(&st, &got, 1).await;
+        let g = got.lock().unwrap();
+        assert_eq!(
+            (
+                g[0]["received_zat"].as_i64(),
+                g[0]["pending_zat"].as_i64(),
+                g[0]["overpaid_zat"].as_i64()
+            ),
+            (Some(100_000), Some(0), Some(0))
+        );
+        assert_eq!(g[0]["txid"], "txB");
+    }
+
+    #[tokio::test]
+    async fn mined_upgrades_in_place() {
+        let st = crate::tests::test_st();
+        setup(&st, "", 100_000, now() + 900);
+        record(&st, 1, D, "t1", 0, 100_000, None).unwrap();
+        record(&st, 1, D, "t1", 0, 100_000, Some(3)).unwrap();
+        assert_eq!(status(&st), "paid");
+        assert_eq!(amounts(&st).await, (100_000, 0, 0));
+    }
+
     #[tokio::test]
     async fn mempool_only_expires() {
         let st = crate::tests::test_st();
@@ -487,7 +569,7 @@ mod tests {
         st.db
             .lock()
             .unwrap()
-            .execute("INSERT INTO payments VALUES('t1',0,'inv',100000,NULL)", [])
+            .execute("INSERT INTO payments(txid,action_idx,invoice_id,value_zat,seen_at) VALUES('t1',0,'inv',100000,?1)", [now()])
             .unwrap();
         sweep(&st);
         assert_eq!(status(&st), "expired");

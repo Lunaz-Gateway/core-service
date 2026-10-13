@@ -146,15 +146,16 @@ pub fn purge(db: &Connection) {
 
 /// Queues the invoice event `typ` for the merchant's webhook.
 pub fn notify(st: &Arc<St>, db: &Connection, id: &str, typ: &str) -> anyhow::Result<()> {
-    let (mid, status, amount, txid, received): (i64, String, i64, Option<String>, i64) = db
+    let (mid, status, amount, txid, received, pending): (i64, String, i64, Option<String>, i64, i64) = db
         .query_row(
             "SELECT i.merchant_id, i.status, i.amount_zat, i.txid,
-            (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=i.id)
+            (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=i.id AND height IS NOT NULL),
+            (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=i.id AND height IS NULL)
          FROM invoices i WHERE i.id=?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )?;
-    let body = json!({"type": typ, "invoice_id": id, "status": status, "amount_zat": amount, "received_zat": received,
+    let body = json!({"type": typ, "invoice_id": id, "status": status, "amount_zat": amount, "received_zat": received, "pending_zat": pending,
         "overpaid_zat": (received - amount).max(0), "txid": txid, "swap": crate::swap::webhook_json(db, id)}).to_string();
     enqueue(st, db, mid, Some(id), typ, body)
 }

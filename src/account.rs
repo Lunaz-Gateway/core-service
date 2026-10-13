@@ -306,7 +306,7 @@ pub async fn test_webhook(State(st): S, h: HeaderMap) -> Result<(StatusCode, Jso
         |r| r.get(0),
     )?;
     url.ok_or_else(|| bad(StatusCode::BAD_REQUEST, "webhook url not set"))?;
-    let body = json!({"type": "test", "invoice_id": null, "status": "paid", "amount_zat": 0, "received_zat": 0, "overpaid_zat": 0, "txid": null, "swap": null}).to_string();
+    let body = json!({"type": "test", "invoice_id": null, "status": "paid", "amount_zat": 0, "received_zat": 0, "pending_zat": 0, "overpaid_zat": 0, "txid": null, "swap": null}).to_string();
     Ok(match crate::hook::send_test(&st, mid, body).await {
         Ok(s) => (StatusCode::OK, Json(json!({"status": s}))),
         Err(e) => (StatusCode::OK, Json(json!({"error": e.to_string()}))),
@@ -322,12 +322,13 @@ pub async fn list_invoices(State(st): S, h: HeaderMap, Query(q): Query<Lim>) -> 
     let mid = auth(&st, &h)?;
     let db = st.db.lock().unwrap();
     let mut s = db.prepare(
-        "SELECT id, status, amount_zat, (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id), address, txid, created_at, expires_at, paid_at
+        "SELECT id, status, amount_zat, (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id AND height IS NOT NULL), address, txid, created_at, expires_at, paid_at,
+         (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id AND height IS NULL)
          FROM invoices WHERE merchant_id=?1 ORDER BY created_at DESC, div_index DESC LIMIT ?2",
     )?;
     let v = s
         .query_map(params![mid, q.limit.unwrap_or(50).clamp(1, 200)], |r| {
-            Ok(json!({"id": r.get::<_, String>(0)?, "status": r.get::<_, String>(1)?, "amount_zat": r.get::<_, i64>(2)?, "received_zat": r.get::<_, i64>(3)?, "overpaid_zat": (r.get::<_, i64>(3)? - r.get::<_, i64>(2)?).max(0),
+            Ok(json!({"id": r.get::<_, String>(0)?, "status": r.get::<_, String>(1)?, "amount_zat": r.get::<_, i64>(2)?, "received_zat": r.get::<_, i64>(3)?, "pending_zat": r.get::<_, i64>(9)?, "overpaid_zat": (r.get::<_, i64>(3)? - r.get::<_, i64>(2)?).max(0),
                 "address": r.get::<_, String>(4)?, "txid": r.get::<_, Option<String>>(5)?, "created_at": r.get::<_, i64>(6)?,
                 "expires_at": r.get::<_, i64>(7)?, "paid_at": r.get::<_, Option<i64>>(8)?}))
         })?

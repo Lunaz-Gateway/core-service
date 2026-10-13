@@ -110,18 +110,19 @@ Sign-in is delegated to an identity provider (Magic, magic.link; email only). Th
 - `PUT /v1/account` `{name}` (1-80 chars) -> 204
 - `PUT /v1/account/viewing-key` `{viewing_key}` -> 204; set once, 409 if already set or used by another account. Accepts a UIVK (`uivk...`) or a UFVK (`uview...`); a UFVK is reduced to its UIVK and only the UIVK is stored. `PUT /v1/account/ufvk` is the legacy alias and also accepts `{ufvk}`.
 - `GET /v1/account/api-keys`; `POST` `{name}` -> 201 `{id, name, prefix, key}` (key shown once); `DELETE /v1/account/api-keys/{id}` -> 204 (revoke)
-- `GET /v1/account/invoices?limit=50` (max 200) -> `[{id, status, amount_zat, received_zat, overpaid_zat, address, txid, created_at, expires_at, paid_at}]`
+- `GET /v1/account/invoices?limit=50` (max 200) -> `[{id, status, amount_zat, received_zat, pending_zat, overpaid_zat, address, txid, created_at, expires_at, paid_at}]`
 
 ### Invoices
 
 - `POST /v1/invoices` (API key; 400 until a viewing key is set) `{amount_zat, expires_in_secs?=900}`. `expires_in_secs` is clamped to 60..86400, `amount_zat` must be 1..21e14. -> `{id, address, amount_zat, zip321_uri, status, expires_at}`
-- `GET /v1/invoices/{id}` (public) -> `{status, amount_zat, received_zat, overpaid_zat, txid, expires_at, swap}`; `swap` is null or `{status, symbol, blockchain, deposit_address, amount_in_formatted, deadline}`
+- `GET /v1/invoices/{id}` (public) -> `{status, amount_zat, received_zat, pending_zat, overpaid_zat, txid, expires_at, swap}`; `swap` is null or `{status, symbol, blockchain, deposit_address, amount_in_formatted, deadline}`
 - `GET /v1/invoices/{id}/ws` WebSocket: `{"status":...}` now and on each change, plus `"swap_status"` (1Click status) when a swap exists. Closes on paid, underpaid or expired.
 
 Statuses: `pending` -> `detected` (seen in mempool or mined) -> `paid` (mined sum >= amount) | `underpaid` | `expired`.
 
 - Payments to one address add up, so a buyer can top up a `detected` invoice before it expires.
-- `overpaid_zat` = max(received - amount, 0). The merchant refunds any excess manually.
+- `received_zat` counts mined payments only; `pending_zat` is the sum still in the mempool (unconfirmed, may never be mined). `overpaid_zat` = max(received - amount, 0). The merchant refunds any excess manually.
+- Unmined payment rows are removed when the invoice reaches a final status, and after 1 h without being mined (the tx was probably dropped).
 - `underpaid` (final): a mined payment exists, the sum is below the amount, and the invoice expired. Lunaz cannot refund; the merchant does. A late top-up that reaches the amount turns `underpaid`/`expired` into `paid`.
 - `detected` from the mempool only and expired for over 1 h becomes `expired` (the tx was probably dropped).
 
@@ -142,7 +143,7 @@ Statuses: `pending` -> `detected` (seen in mempool or mined) -> `paid` (mined su
 - `POST /v1/account/webhook/events/retry-failed` -> `{retried: n}`; requeues the failed events of the last 7 days (max 100).
 - `GET /v1/account/webhook/deliveries?limit=50` (max 200) -> newest first `[{id, invoice_id, type, url, status_code, error, attempt, created_at, event_id}]`, one row per attempt.
 - Delivery: POST with header `X-Lunaz-Signature` = hex HMAC-SHA256 of the raw body, keyed with the merchant's current webhook secret (at send time). Compare in constant time.
-- Body always: `{type, invoice_id, status, amount_zat, received_zat, overpaid_zat, txid, swap}` (invoice events). `swap` is `{asset, blockchain, amount_in_formatted, status}` or null.
+- Body always: `{type, invoice_id, status, amount_zat, received_zat, pending_zat, overpaid_zat, txid, swap}` (invoice events; amounts as for `GET /v1/invoices/{id}`). `swap` is `{asset, blockchain, amount_in_formatted, status}` or null.
 - Types: `invoice.paid`, `invoice.underpaid`, `swap.refunded`, `swap.failed`, `swap.incomplete_deposit` (the swap ones leave the invoice `pending`; the buyer can start another swap or pay ZEC), `withdrawal.updated`, `plan.updated` and `test` (`invoice_id: null`).
 - Events are stored in the database before sending, so pending events survive a restart. A background loop (every 2 s) sends due events. Statuses: `pending` -> `delivered` (any 2xx) | `failed`.
 - 3 attempts in total: immediately, after 10 s, after 60 s. A non-2xx or network error uses up an attempt; after the third the event is `failed` (`next_attempt_at: null`). No webhook URL at send time -> `failed` with `last_error: "no webhook URL configured"`. Events are only created while a URL is set.
@@ -194,7 +195,7 @@ All features are on every plan; only volume is limited. Existing merchants are o
 
 `GET /v1/account/export.csv?from=<unix>&to=<unix>&kind=invoices|payments`. `kind` defaults to `invoices`; the range filters on invoice `created_at` (default all); max 50000 rows. Returns a `text/csv` attachment `lunaz-<kind>-<from>-<to>.csv` with a header row and RFC 4180 quoting. ZEC amounts are exact 8-decimal strings.
 
-- `invoices`: `invoice_id, created_at, paid_at, status, amount_zec, received_zec, overpaid_zec, usd_rate, received_usd, txid, paid_with, origin_chain, origin_amount, swap_status`. Dates are ISO 8601 UTC. `usd_rate` (USD per ZEC) is recorded from the 1Click price when the invoice turns paid or underpaid; older invoices have none. `paid_with` is `ZEC` or the swap symbol once the swap succeeded.
+- `invoices`: `invoice_id, created_at, paid_at, status, amount_zec, received_zec (mined), overpaid_zec, usd_rate, received_usd, txid, paid_with, origin_chain, origin_amount, swap_status`. Dates are ISO 8601 UTC. `usd_rate` (USD per ZEC) is recorded from the 1Click price when the invoice turns paid or underpaid; older invoices have none. `paid_with` is `ZEC` or the swap symbol once the swap succeeded.
 - `payments`: `txid, action_index, pool (orchard|ironwood), invoice_id, value_zec, block_height (empty while mempool only), invoice_status`.
 
 ### Other

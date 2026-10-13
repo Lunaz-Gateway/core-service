@@ -55,7 +55,7 @@ pub async fn export_csv(
             );
             let mut stmt = db.prepare(
                 "SELECT i.id, i.created_at, i.paid_at, i.status, i.amount_zat,
-                    (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=i.id), i.paid_usd_rate, i.txid,
+                    (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=i.id AND height IS NOT NULL), i.paid_usd_rate, i.txid,
                     w.symbol, w.blockchain, w.amount_in_formatted, w.status
                  FROM invoices i LEFT JOIN swaps w ON w.invoice_id=i.id
                  WHERE i.merchant_id=?1 AND i.created_at>=?2 AND i.created_at<=?3
