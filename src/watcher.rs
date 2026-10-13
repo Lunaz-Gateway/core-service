@@ -1,4 +1,4 @@
-use crate::{now, St};
+use crate::{now, Lk, St};
 use anyhow::Result;
 use orchard::{
     keys::{IncomingViewingKey, PreparedIncomingViewingKey},
@@ -26,7 +26,7 @@ struct Key {
 }
 
 fn keys(st: &St) -> Result<Vec<Key>> {
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let mut q = db.prepare("SELECT id, ufvk FROM merchants WHERE ufvk IS NOT NULL")?;
     let rows = q.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
     let mut out = vec![];
@@ -71,29 +71,28 @@ fn expire(st: &Arc<St>) {
     sweep(st);
     crate::offramp::expire(st);
     crate::billing::sweep(st);
-    crate::hook::purge(&st.db.lock().unwrap());
+    crate::hook::purge(&st.db.lk());
     let _ = st
         .db
-        .lock()
-        .unwrap()
+        .lk()
         .execute("DELETE FROM sessions WHERE expires_at<?1", [now()]);
     st.limits.purge(now());
     let ids: Vec<String> = (|| -> Result<_> {
-        let db = st.db.lock().unwrap();
+        let db = st.db.lk();
         let mut q = db.prepare("UPDATE invoices SET status='expired' WHERE status='pending' AND expires_at<?1 RETURNING id")?;
         let ids = q.query_map([now()], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         Ok(ids)
     })()
     .unwrap_or_default();
     for id in ids {
-        let _ = crate::billing::on_invoice(st, &st.db.lock().unwrap(), &id, "expired");
+        let _ = crate::billing::on_invoice(st, &st.db.lk(), &id, "expired");
         let _ = st.events.send((id, "expired".into()));
     }
 }
 
 // Re-evaluates detected invoices: expiry turns them underpaid, or expired if never mined.
 fn sweep(st: &Arc<St>) {
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     // An unmined payment not mined within the hour was most likely dropped.
     let _ = db.execute(
         "DELETE FROM payments WHERE height IS NULL AND COALESCE(seen_at,0)<?1",
@@ -115,14 +114,12 @@ async fn scan_once(st: &Arc<St>) -> Result<()> {
     let tip = c.get_latest_block(ChainSpec {}).await?.into_inner().height;
     let synced: Option<u64> = st
         .db
-        .lock()
-        .unwrap()
+        .lk()
         .query_row("SELECT height FROM sync_state", [], |r| r.get(0))
         .optional()?;
     let Some(mut h) = synced else {
         st.db
-            .lock()
-            .unwrap()
+            .lk()
             .execute("INSERT INTO sync_state(id,height) VALUES(1,?1)", [tip])?;
         tracing::info!("first start, syncing from tip {tip}");
         return Ok(());
@@ -189,10 +186,7 @@ async fn scan_once(st: &Arc<St>) -> Result<()> {
             }
         }
         h = end;
-        st.db
-            .lock()
-            .unwrap()
-            .execute("UPDATE sync_state SET height=?1", [h])?;
+        st.db.lk().execute("UPDATE sync_state SET height=?1", [h])?;
         tracing::info!("scanned to {h} (tip {tip})");
     }
     Ok(())
@@ -268,7 +262,7 @@ fn record(
     let Some(Ok(div)) = div.checked_sub(crate::api::INDEX_BASE).map(i64::try_from) else {
         return Ok(());
     };
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let Some((id, status)) = db
         .query_row(
             "SELECT id, status FROM invoices WHERE merchant_id=?1 AND div_index=?2",
@@ -345,7 +339,7 @@ fn transition(st: &Arc<St>, db: &Connection, id: &str, txid: Option<&str>) -> Re
             let (st, id) = (st.clone(), id.to_string());
             h.spawn(async move {
                 if let Some(p) = crate::swap::zec_price(&st).await {
-                    let _ = st.db.lock().unwrap().execute(
+                    let _ = st.db.lk().execute(
                         "UPDATE invoices SET paid_usd_rate=?1 WHERE id=?2",
                         params![p, id],
                     );
@@ -401,13 +395,13 @@ mod tests {
     }
 
     fn setup(st: &St, url: &str, amount: i64, expires: i64) {
-        let db = st.db.lock().unwrap();
+        let db = st.db.lk();
         db.execute("INSERT INTO merchants(id,email,password_hash,name,webhook_url,webhook_secret) VALUES(1,'a@b.co','x','n',?1,'s')", [url]).unwrap();
         db.execute("INSERT INTO invoices(id,merchant_id,div_index,address,amount_zat,status,created_at,expires_at) VALUES('inv',1,0,'addr',?1,'pending',0,?2)", params![amount, expires]).unwrap();
     }
 
     fn status(st: &St) -> String {
-        let db = st.db.lock().unwrap();
+        let db = st.db.lk();
         db.query_row("SELECT status FROM invoices WHERE id='inv'", [], |r| {
             r.get(0)
         })
@@ -421,7 +415,7 @@ mod tests {
         let app = Router::new().route(
             "/",
             post(move |b: String| async move {
-                g.lock().unwrap().push(serde_json::from_str(&b).unwrap());
+                g.lk().push(serde_json::from_str(&b).unwrap());
             }),
         );
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -433,7 +427,7 @@ mod tests {
     async fn wait(st: &Arc<St>, got: &std::sync::Mutex<Vec<serde_json::Value>>, n: usize) {
         for _ in 0..50 {
             crate::hook::tick(st.clone()).await;
-            if got.lock().unwrap().len() >= n {
+            if got.lk().len() >= n {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -454,7 +448,7 @@ mod tests {
         record(&st, 1, D, "t2", 0, 67_000, Some(6)).unwrap(); // second payment adds up
         assert_eq!(status(&st), "paid");
         wait(&st, &got, 1).await;
-        let g = got.lock().unwrap();
+        let g = got.lk();
         assert_eq!(g.len(), 1);
         assert_eq!(g[0]["type"], "invoice.paid");
         assert_eq!(
@@ -473,15 +467,14 @@ mod tests {
         sweep(&st);
         assert_eq!(status(&st), "detected");
         st.db
-            .lock()
-            .unwrap()
+            .lk()
             .execute("UPDATE invoices SET expires_at=?1", [now() - 1])
             .unwrap();
         sweep(&st);
         assert_eq!(status(&st), "underpaid");
         wait(&st, &got, 1).await;
         {
-            let g = got.lock().unwrap();
+            let g = got.lk();
             assert_eq!(g[0]["type"], "invoice.underpaid");
             assert_eq!(
                 (g[0]["status"].as_str(), g[0]["overpaid_zat"].as_i64()),
@@ -517,8 +510,7 @@ mod tests {
         assert_eq!(status(&st), "detected");
         assert_eq!(amounts(&st).await, (0, 130_000, 0));
         st.db
-            .lock()
-            .unwrap()
+            .lk()
             .execute(
                 "UPDATE payments SET seen_at=?1 WHERE txid='txC'",
                 [now() - 7200],
@@ -535,7 +527,7 @@ mod tests {
         record(&st, 1, D, "txA", 0, 100_000, None).unwrap(); // re-seen in mempool
         assert_eq!(amounts(&st).await, (100_000, 0, 0));
         wait(&st, &got, 1).await;
-        let g = got.lock().unwrap();
+        let g = got.lk();
         assert_eq!(
             (
                 g[0]["received_zat"].as_i64(),
@@ -562,13 +554,11 @@ mod tests {
         let st = crate::tests::test_st();
         setup(&st, "", 100_000, now() - 7200);
         st.db
-            .lock()
-            .unwrap()
+            .lk()
             .execute("UPDATE invoices SET status='detected'", [])
             .unwrap();
         st.db
-            .lock()
-            .unwrap()
+            .lk()
             .execute("INSERT INTO payments(txid,action_idx,invoice_id,value_zat,seen_at) VALUES('t1',0,'inv',100000,?1)", [now()])
             .unwrap();
         sweep(&st);

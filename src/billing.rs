@@ -1,7 +1,7 @@
 //! Plans, usage limits and ZEC billing. Subscriptions are paid through an ordinary invoice on the treasury merchant.
 use crate::account::{auth, S};
 use crate::api::{bad, new_invoice, AppErr, R};
-use crate::{now, St};
+use crate::{now, Lk, St};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -172,7 +172,7 @@ pub async fn plans(State(st): S) -> R {
 
 pub async fn my_plan(State(st): S, h: HeaderMap) -> R {
     let mid = auth(&st, &h)?;
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let p = plan_of(&st, &db, mid)?;
     let (inv, keys) = usage(&db, mid)?;
     let exp: Option<i64> = db.query_row(
@@ -191,7 +191,7 @@ pub async fn my_plan(State(st): S, h: HeaderMap) -> R {
 
 pub async fn list(State(st): S, h: HeaderMap) -> R {
     let mid = auth(&st, &h)?;
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let mut q = db.prepare(
         "SELECT s.id, s.plan, s.months, s.price_usd, s.amount_zat, s.zec_usd, s.invoice_id, s.status, i.status, s.created_at, s.paid_at, s.period_start, s.period_end
          FROM subscriptions s LEFT JOIN invoices i ON i.id=s.invoice_id WHERE s.merchant_id=?1 ORDER BY s.created_at DESC, s.rowid DESC",
@@ -247,7 +247,7 @@ pub async fn checkout(State(st): S, h: HeaderMap, Json(b): Json<Checkout>) -> R 
     let price = p.price_usd.unwrap() * b.months as f64;
     let amount = amount_zat(p.price_usd.unwrap(), b.months, zec_usd);
     let sid = uuid::Uuid::new_v4().to_string();
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let ready: bool = db.query_row(
         "SELECT COUNT(*) > 0 FROM merchants WHERE id=?1 AND ufvk IS NOT NULL",
         [treasury],
@@ -282,7 +282,7 @@ pub async fn simulate_paid(State(st): S, h: HeaderMap, Path(sid): Path<String>) 
         return Err(bad(StatusCode::NOT_FOUND, "not found"));
     }
     let mid = auth(&st, &h)?;
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let owned: bool = db.query_row(
         "SELECT COUNT(*) > 0 FROM subscriptions WHERE id=?1 AND merchant_id=?2",
         params![sid, mid],
@@ -373,7 +373,7 @@ pub fn on_invoice(
 
 /// Drops expired paid plans back to free.
 pub fn sweep(st: &Arc<St>) {
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let ids: Vec<i64> = db
         .prepare("UPDATE merchants SET plan='free', plan_expires_at=NULL WHERE plan!='free' AND plan_expires_at IS NOT NULL AND plan_expires_at<=?1 RETURNING id")
         .and_then(|mut q| q.query_map([now()], |r| r.get(0))?.collect())
@@ -407,7 +407,7 @@ mod tests {
             (LATE_GRACE + 60, ("late_paid", "free", 0)),
         ] {
             let st = crate::tests::test_st();
-            let db = st.db.lock().unwrap();
+            let db = st.db.lk();
             db.execute("INSERT INTO merchants(id,email,password_hash,name,webhook_url,webhook_secret) VALUES(2,'c@d.co','','','http://127.0.0.1:9/','s')", []).unwrap();
             db.execute("INSERT INTO invoices(id,merchant_id,div_index,address,amount_zat,status,created_at,expires_at) VALUES('bi',1,0,'a',1,'paid',0,?1)", [now() - late]).unwrap();
             db.execute("INSERT INTO subscriptions(id,merchant_id,plan,months,price_usd,amount_zat,zec_usd,invoice_id,status,created_at) VALUES('s',2,'pro',1,29,1,50,'bi','expired',0)", []).unwrap();

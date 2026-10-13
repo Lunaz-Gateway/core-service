@@ -1,5 +1,5 @@
 use crate::api::{bad, bearer, parse_viewing_key, rand_hex, sha_hex, AppErr, R};
-use crate::{now, St};
+use crate::{now, Lk, St};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -35,7 +35,7 @@ pub fn ct_eq(a: &str, b: &str) -> bool {
 
 fn new_session(st: &St, mid: i64) -> anyhow::Result<Value> {
     let t = rand_hex();
-    st.db.lock().unwrap().execute(
+    st.db.lk().execute(
         "INSERT INTO sessions(token_hash,merchant_id,expires_at) VALUES(?1,?2,?3)",
         params![sha_hex(&t), mid, now() + SESSION_SECS],
     )?;
@@ -45,8 +45,7 @@ fn new_session(st: &St, mid: i64) -> anyhow::Result<Value> {
 pub fn auth(st: &St, h: &HeaderMap) -> Result<i64, AppErr> {
     let t = bearer(h).ok_or_else(|| bad(StatusCode::UNAUTHORIZED, "missing session token"))?;
     st.db
-        .lock()
-        .unwrap()
+        .lk()
         .query_row(
             "SELECT merchant_id FROM sessions WHERE token_hash=?1 AND expires_at>?2",
             params![sha_hex(t), now()],
@@ -86,7 +85,7 @@ pub async fn exchange(State(st): S, h: HeaderMap, Json(b): Json<Exchange>) -> R 
             "too many attempts, try again later",
         ));
     }
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     // INSERT OR IGNORE keeps create-or-reuse atomic under concurrent exchanges.
     let new = db.execute(
         "INSERT OR IGNORE INTO merchants(email,password_hash,name,webhook_secret) VALUES(?1,'','',?2)",
@@ -114,15 +113,14 @@ pub async fn set_name(State(st): S, h: HeaderMap, Json(b): Json<SetName>) -> NoB
         return Err(bad(StatusCode::BAD_REQUEST, "name must be 1-80 characters"));
     }
     st.db
-        .lock()
-        .unwrap()
+        .lk()
         .execute("UPDATE merchants SET name=?1 WHERE id=?2", params![n, mid])?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn logout(State(st): S, h: HeaderMap) -> NoBody {
     auth(&st, &h)?;
-    st.db.lock().unwrap().execute(
+    st.db.lk().execute(
         "DELETE FROM sessions WHERE token_hash=?1",
         [sha_hex(bearer(&h).unwrap())],
     )?;
@@ -136,7 +134,7 @@ pub async fn account(State(st): S, h: HeaderMap) -> R {
     } else {
         "test"
     };
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let mut v = db.query_row("SELECT id, email, name, ufvk IS NOT NULL, webhook_url FROM merchants WHERE id=?1", [mid], |r| {
         Ok(json!({"id": r.get::<_, i64>(0)?, "email": r.get::<_, String>(1)?, "name": r.get::<_, String>(2)?, "network": net,
             "ufvk_set": r.get::<_, bool>(3)?, "viewing_key_set": r.get::<_, bool>(3)?, "webhook_url": r.get::<_, Option<String>>(4)?}))
@@ -158,7 +156,7 @@ pub async fn set_ufvk(State(st): S, h: HeaderMap, Json(b): Json<SetUfvk>) -> NoB
         .map_err(|e| bad(StatusCode::BAD_REQUEST, &e.to_string()))?;
     // Conditional update keeps set-once atomic.
     // Two accounts sharing a wallet would derive identical invoice addresses; UNIQUE(orchard_ivk_hash) also catches a re-encoded key.
-    let n = match st.db.lock().unwrap().execute(
+    let n = match st.db.lk().execute(
         "UPDATE merchants SET ufvk=?1, orchard_ivk_hash=?3 WHERE id=?2 AND ufvk IS NULL",
         params![u.encode(&st.net), mid, crate::api::orchard_ivk_hash(&u)],
     ) {
@@ -180,7 +178,7 @@ pub async fn set_ufvk(State(st): S, h: HeaderMap, Json(b): Json<SetUfvk>) -> NoB
 
 pub async fn list_keys(State(st): S, h: HeaderMap) -> R {
     let mid = auth(&st, &h)?;
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let mut q = db.prepare("SELECT id, name, prefix, created_at, last_used_at, revoked_at FROM api_keys WHERE merchant_id=?1 ORDER BY id DESC")?;
     let v = q
         .query_map([mid], |r| {
@@ -207,7 +205,7 @@ pub async fn create_key(
     }
     let key = format!("lz_{}", rand_hex());
     let prefix = &key[..12];
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     crate::billing::check_keys(&st, &db, mid)?;
     db.execute(
         "INSERT INTO api_keys(merchant_id,name,prefix,key_hash,created_at) VALUES(?1,?2,?3,?4,?5)",
@@ -223,7 +221,7 @@ pub async fn create_key(
 
 pub async fn revoke_key(State(st): S, h: HeaderMap, Path(id): Path<i64>) -> NoBody {
     let mid = auth(&st, &h)?;
-    let n = st.db.lock().unwrap().execute(
+    let n = st.db.lk().execute(
         "UPDATE api_keys SET revoked_at=COALESCE(revoked_at,?1) WHERE id=?2 AND merchant_id=?3",
         params![now(), id, mid],
     )?;
@@ -235,7 +233,7 @@ pub async fn revoke_key(State(st): S, h: HeaderMap, Path(id): Path<i64>) -> NoBo
 
 pub async fn get_webhook(State(st): S, h: HeaderMap) -> R {
     let mid = auth(&st, &h)?;
-    let v = st.db.lock().unwrap().query_row(
+    let v = st.db.lk().query_row(
         "SELECT webhook_url, webhook_secret FROM merchants WHERE id=?1",
         [mid],
         |r| Ok(json!({"url": r.get::<_, Option<String>>(0)?, "secret": r.get::<_, String>(1)?})),
@@ -253,7 +251,7 @@ pub async fn set_webhook(State(st): S, h: HeaderMap, Json(b): Json<SetWebhook>) 
     if let Some(u) = &b.url {
         crate::hook::check_url(u, &st.hook).map_err(|m| bad(StatusCode::BAD_REQUEST, m))?;
     }
-    st.db.lock().unwrap().execute(
+    st.db.lk().execute(
         "UPDATE merchants SET webhook_url=?1 WHERE id=?2",
         params![b.url, mid],
     )?;
@@ -263,7 +261,7 @@ pub async fn set_webhook(State(st): S, h: HeaderMap, Json(b): Json<SetWebhook>) 
 pub async fn rotate_webhook(State(st): S, h: HeaderMap) -> R {
     let mid = auth(&st, &h)?;
     let secret = rand_hex();
-    st.db.lock().unwrap().execute(
+    st.db.lk().execute(
         "UPDATE merchants SET webhook_secret=?1 WHERE id=?2",
         params![secret, mid],
     )?;
@@ -272,7 +270,7 @@ pub async fn rotate_webhook(State(st): S, h: HeaderMap) -> R {
 
 pub async fn test_webhook(State(st): S, h: HeaderMap) -> Result<(StatusCode, Json<Value>), AppErr> {
     let mid = auth(&st, &h)?;
-    let url: Option<String> = st.db.lock().unwrap().query_row(
+    let url: Option<String> = st.db.lk().query_row(
         "SELECT webhook_url FROM merchants WHERE id=?1",
         [mid],
         |r| r.get(0),
@@ -298,7 +296,7 @@ pub struct Lim {
 
 pub async fn list_invoices(State(st): S, h: HeaderMap, Query(q): Query<Lim>) -> R {
     let mid = auth(&st, &h)?;
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let mut s = db.prepare(
         "SELECT id, status, amount_zat, (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id AND height IS NOT NULL), address, txid, created_at, expires_at, paid_at,
          (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id AND height IS NULL)
@@ -316,7 +314,7 @@ pub async fn list_invoices(State(st): S, h: HeaderMap, Query(q): Query<Lim>) -> 
 
 pub async fn list_deliveries(State(st): S, h: HeaderMap, Query(q): Query<Lim>) -> R {
     let mid = auth(&st, &h)?;
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let mut s = db.prepare(
         "SELECT id, invoice_id, type, url, status_code, error, attempt, created_at, event_id FROM webhook_deliveries WHERE merchant_id=?1 ORDER BY id DESC LIMIT ?2",
     )?;
@@ -371,7 +369,7 @@ pub async fn list_events(State(st): S, h: HeaderMap, Query(q): Query<EventsQ>) -
             "status must be pending, delivered or failed",
         ));
     }
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let ids: Vec<String> = db
         .prepare("SELECT id FROM webhook_events WHERE merchant_id=?1 AND (?2 IS NULL OR status=?2) ORDER BY created_at DESC, rowid DESC LIMIT ?3")?
         .query_map(params![mid, q.status, q.limit.unwrap_or(50).clamp(1, 200)], |r| r.get(0))?
@@ -385,7 +383,7 @@ pub async fn list_events(State(st): S, h: HeaderMap, Query(q): Query<EventsQ>) -
 
 pub async fn retry_event(State(st): S, h: HeaderMap, Path(id): Path<String>) -> R {
     let mid = auth(&st, &h)?;
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     if !crate::hook::retry(&db, mid, &id)? {
         let found = event_json(&db, mid, &id)?.is_some();
         return Err(if found {
@@ -399,7 +397,7 @@ pub async fn retry_event(State(st): S, h: HeaderMap, Path(id): Path<String>) -> 
 
 pub async fn retry_failed(State(st): S, h: HeaderMap) -> R {
     let mid = auth(&st, &h)?;
-    let n = crate::hook::retry_failed(&st.db.lock().unwrap(), mid)?;
+    let n = crate::hook::retry_failed(&st.db.lk(), mid)?;
     Ok(Json(json!({"retried": n})))
 }
 

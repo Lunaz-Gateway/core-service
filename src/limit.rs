@@ -1,4 +1,5 @@
 //! In-memory sliding-window rate limiter.
+use crate::Lk;
 use std::{collections::HashMap, sync::Mutex};
 
 pub const WINDOW: i64 = 900; // longest window in use; purge() drops older hits
@@ -9,7 +10,7 @@ pub struct Limiter(Mutex<HashMap<String, Vec<i64>>>);
 impl Limiter {
     /// Records a hit; false when `max` hits already happened within `window` seconds.
     pub fn hit(&self, key: &str, max: usize, window: i64, now: i64) -> bool {
-        let mut m = self.0.lock().unwrap();
+        let mut m = self.0.lk();
         let v = m.entry(key.to_string()).or_default();
         v.retain(|t| *t > now - window);
         if v.len() >= max {
@@ -20,7 +21,7 @@ impl Limiter {
     }
     // ponytail: process-local, lost on restart and not shared between instances
     pub fn purge(&self, now: i64) {
-        self.0.lock().unwrap().retain(|_, v| {
+        self.0.lk().retain(|_, v| {
             v.retain(|t| *t > now - WINDOW);
             !v.is_empty()
         });
@@ -39,6 +40,6 @@ mod tests {
         assert!(l.hit("b", 3, 100, 1010)); // keys are independent
         assert!(l.hit("a", 3, 100, 1101)); // oldest hit left the window
         l.purge(1000 + WINDOW + 200);
-        assert!(l.0.lock().unwrap().is_empty());
+        assert!(l.0.lk().is_empty());
     }
 }

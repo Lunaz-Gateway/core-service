@@ -1,6 +1,6 @@
 //! Cross-chain payments via NEAR Intents 1Click: the buyer pays on their chain, 1Click delivers ZEC to the invoice address.
 use crate::api::{bad, AppErr, R};
-use crate::{now, St};
+use crate::{now, Lk, St};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -57,7 +57,7 @@ fn call(st: &St, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
 }
 
 async fn assets(st: &St) -> anyhow::Result<Vec<Value>> {
-    if let Some((t, v)) = &*st.assets.lock().unwrap() {
+    if let Some((t, v)) = &*st.assets.lk() {
         if *t > now() - 300 {
             return Ok(v.clone());
         }
@@ -69,20 +69,20 @@ async fn assets(st: &St) -> anyhow::Result<Vec<Value>> {
         .json()
         .await?;
     let v = curate(&toks);
-    *st.zec_price.lock().unwrap() = toks
+    *st.zec_price.lk() = toks
         .as_array()
         .into_iter()
         .flatten()
         .find(|t| t["assetId"] == ZEC)
         .and_then(|t| t["price"].as_f64());
-    *st.assets.lock().unwrap() = Some((now(), v.clone()));
+    *st.assets.lk() = Some((now(), v.clone()));
     Ok(v)
 }
 
 /// ZEC price in USD from the cached 1Click token list; None when unavailable.
 pub async fn zec_price(st: &St) -> Option<f64> {
     assets(st).await.ok()?;
-    st.zec_price.lock().unwrap().filter(|p| *p > 0.0)
+    st.zec_price.lk().filter(|p| *p > 0.0)
 }
 
 pub async fn list_assets(State(st): State<Arc<St>>) -> R {
@@ -187,8 +187,7 @@ pub async fn create_swap(
     type Inv = (String, i64, String, i64, bool, bool);
     let (status, amount, address, expires, extended, billing): Inv = st
         .db
-        .lock()
-        .unwrap()
+        .lk()
         .query_row(
             "SELECT status, amount_zat, address, expires_at, extended_at IS NOT NULL,
              EXISTS(SELECT 1 FROM subscriptions WHERE invoice_id=invoices.id) FROM invoices WHERE id=?1",
@@ -210,7 +209,7 @@ pub async fn create_swap(
     }
     let (new_exp, deadline) =
         window(expires, extended, billing, t).map_err(|m| bad(StatusCode::CONFLICT, m))?;
-    if let Some(s) = active(&st.db.lock().unwrap(), &id)? {
+    if let Some(s) = active(&st.db.lk(), &id)? {
         return Err(bad(
             StatusCode::CONFLICT,
             &format!("a swap is already in progress ({s})"),
@@ -253,7 +252,7 @@ pub async fn create_swap(
     };
     let s = |k: &str| q[k].as_str().map(String::from);
     let sid = uuid::Uuid::new_v4().to_string();
-    let conflict = commit(&st.db.lock().unwrap(), &id, t, new_exp, |db| {
+    let conflict = commit(&st.db.lk(), &id, t, new_exp, |db| {
         db.execute(
             "INSERT INTO swaps(id,invoice_id,origin_asset,symbol,blockchain,deposit_address,deposit_memo,amount_in,amount_in_formatted,amount_in_usd,refund_to,deadline,created_at,updated_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)",
@@ -305,7 +304,7 @@ pub async fn poller(st: Arc<St>) {
 async fn poll_once(st: &Arc<St>) -> anyhow::Result<()> {
     type Row = (String, String, String, Option<String>, String);
     let rows: Vec<Row> = {
-        let db = st.db.lock().unwrap();
+        let db = st.db.lk();
         let mut q = db.prepare(&format!("SELECT id, invoice_id, deposit_address, deposit_memo, status FROM swaps WHERE status NOT IN {FINAL} AND created_at>?1"))?;
         let v = q
             .query_map([now() - 7200], |r| {
@@ -331,7 +330,7 @@ async fn poll_once(st: &Arc<St>) -> anyhow::Result<()> {
             continue;
         };
         let inv_status = {
-            let db = st.db.lock().unwrap();
+            let db = st.db.lk();
             db.execute(
                 "UPDATE swaps SET status=?1, updated_at=?2 WHERE id=?3",
                 params![new, now(), sid],
@@ -349,7 +348,7 @@ async fn poll_once(st: &Arc<St>) -> anyhow::Result<()> {
             _ => None,
         };
         if let Some(t) = typ {
-            crate::hook::notify(st, &st.db.lock().unwrap(), &inv, t)?;
+            crate::hook::notify(st, &st.db.lk(), &inv, t)?;
         }
         let _ = st.events.send((inv, inv_status));
     }
@@ -404,7 +403,7 @@ mod tests {
     #[test]
     fn commit_keeps_progressed_swap() {
         let st = crate::tests::test_st();
-        let db = st.db.lock().unwrap();
+        let db = st.db.lk();
         let t = now();
         db.execute("INSERT INTO invoices(id,merchant_id,div_index,address,amount_zat,status,created_at,expires_at) VALUES('inv',1,0,'addr',1,'pending',?1,?2)", params![t, t + 300]).unwrap();
         swap(&db, "old", "PENDING_DEPOSIT").unwrap();

@@ -1,5 +1,5 @@
 //! Webhook delivery: persisted events, a background loop sends them, every attempt logged in `webhook_deliveries`.
-use crate::{now, St};
+use crate::{now, Lk, St};
 use hmac::{Hmac, Mac};
 use reqwest::{dns, Url};
 use rusqlite::{params, Connection};
@@ -235,7 +235,7 @@ fn insert(
 /// Outer error: database; inner: the HTTP status or a coarse delivery error.
 async fn send(st: &St, id: &str, retry: bool) -> anyhow::Result<Result<u16, &'static str>> {
     let (mid, invoice, typ, body, attempts, url, secret): (i64, Option<String>, String, String, i64, Option<String>, String) =
-        st.db.lock().unwrap().query_row(
+        st.db.lk().query_row(
             "SELECT e.merchant_id, e.invoice_id, e.type, e.body, e.attempts, m.webhook_url, m.webhook_secret
              FROM webhook_events e JOIN merchants m ON m.id=e.merchant_id WHERE e.id=?1",
             [id],
@@ -244,7 +244,7 @@ async fn send(st: &St, id: &str, retry: bool) -> anyhow::Result<Result<u16, &'st
     let attempt = attempts + 1;
     let Some(url) = url else {
         let e = "no webhook URL configured";
-        st.db.lock().unwrap().execute(
+        st.db.lk().execute(
             "UPDATE webhook_events SET status='failed', attempts=?1, next_attempt_at=NULL, last_status_code=NULL, last_error=?2, updated_at=?3 WHERE id=?4",
             params![attempt, e, now(), id],
         )?;
@@ -259,7 +259,7 @@ async fn send(st: &St, id: &str, retry: bool) -> anyhow::Result<Result<u16, &'st
     };
     let (status, delay) = decide(attempt, ok, retry);
     let t = now();
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     db.execute(
         "INSERT INTO webhook_deliveries(merchant_id,invoice_id,type,url,status_code,error,attempt,created_at,event_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         params![mid, invoice, typ, url, r.ok(), r.err(), attempt, t, id],
@@ -277,14 +277,14 @@ pub async fn send_test(
     mid: i64,
     body: String,
 ) -> anyhow::Result<Result<u16, &'static str>> {
-    let id = insert(&st.db.lock().unwrap(), mid, None, "test", &body, None)?;
+    let id = insert(&st.db.lk(), mid, None, "test", &body, None)?;
     send(st, &id, false).await
 }
 
 /// Claims due pending events (lease) and sends each one.
 pub async fn tick(st: Arc<St>) {
     let ids: Vec<String> = (|| -> rusqlite::Result<_> {
-        let db = st.db.lock().unwrap();
+        let db = st.db.lk();
         let t = now();
         let mut q = db.prepare(
             "UPDATE webhook_events SET next_attempt_at=?1 WHERE id IN
@@ -483,12 +483,11 @@ mod tests {
         ))
         .await;
         let st = crate::tests::test_st();
-        st.db.lock().unwrap().execute("INSERT INTO merchants(id,email,password_hash,name,webhook_url,webhook_secret) VALUES(1,'a','','',?1,'s')", [format!("{a}/")]).unwrap();
+        st.db.lk().execute("INSERT INTO merchants(id,email,password_hash,name,webhook_url,webhook_secret) VALUES(1,'a','','',?1,'s')", [format!("{a}/")]).unwrap();
         assert_eq!(send_test(&st, 1, "{}".into()).await.unwrap(), Ok(303));
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         st.db
-            .lock()
-            .unwrap()
+            .lk()
             .execute("UPDATE merchants SET webhook_url='http://127.0.0.1:1/'", [])
             .unwrap();
         assert_eq!(
@@ -497,8 +496,7 @@ mod tests {
         );
         let errs: Vec<Option<String>> = st
             .db
-            .lock()
-            .unwrap()
+            .lk()
             .prepare("SELECT error FROM webhook_deliveries ORDER BY id")
             .unwrap()
             .query_map([], |r| r.get(0))
@@ -538,7 +536,7 @@ mod tests {
     #[test]
     fn retry_resets() {
         let st = crate::tests::test_st();
-        let db = st.db.lock().unwrap();
+        let db = st.db.lk();
         db.execute("INSERT INTO merchants(id,email,password_hash,name,webhook_secret) VALUES(1,'a','','','s')", []).unwrap();
         let id = insert(&db, 1, None, "test", "{}", None).unwrap();
         assert!(!retry(&db, 1, &id).unwrap()); // pending: not retryable

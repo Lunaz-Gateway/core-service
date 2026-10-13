@@ -3,7 +3,7 @@
 //! order and its status only, never bank account numbers or KYC data.
 use crate::account::{auth, S};
 use crate::api::{bad, AppErr, R};
-use crate::{now, St};
+use crate::{now, Lk, St};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -182,7 +182,7 @@ pub fn apply(
     expires_at: Option<i64>,
     bank: Option<&str>,
 ) -> anyhow::Result<bool> {
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     #[allow(clippy::type_complexity)]
     let Some((cur, mid, amount, cc, fiat)): Option<(String, i64, i64, String, String)> = db
         .query_row(
@@ -218,7 +218,7 @@ pub fn apply(
 /// Expires withdrawals whose quote or deposit window has passed.
 pub fn expire(st: &Arc<St>) {
     let ids: Vec<String> = (|| -> rusqlite::Result<_> {
-        let db = st.db.lock().unwrap();
+        let db = st.db.lk();
         let mut q = db.prepare("SELECT id FROM withdrawals WHERE status IN ('awaiting_kyc','awaiting_deposit') AND expires_at<?1")?;
         let v = q.query_map([now()], |r| r.get(0))?.collect();
         v
@@ -259,8 +259,7 @@ fn wjson(db: &Connection, mid: i64, id: &str) -> rusqlite::Result<Option<Value>>
 }
 
 fn get_owned(st: &St, mid: i64, id: &str) -> Result<Value, AppErr> {
-    wjson(&st.db.lock().unwrap(), mid, id)?
-        .ok_or_else(|| bad(StatusCode::NOT_FOUND, "no such withdrawal"))
+    wjson(&st.db.lk(), mid, id)?.ok_or_else(|| bad(StatusCode::NOT_FOUND, "no such withdrawal"))
 }
 
 fn mock_only(st: &St) -> Result<(), AppErr> {
@@ -272,7 +271,7 @@ fn mock_only(st: &St) -> Result<(), AppErr> {
 
 pub async fn info(State(st): S, h: HeaderMap) -> R {
     let mid = auth(&st, &h)?;
-    let received: i64 = st.db.lock().unwrap().query_row(
+    let received: i64 = st.db.lk().query_row(
         "SELECT COALESCE(SUM(p.value_zat),0) FROM payments p JOIN invoices i ON i.id=p.invoice_id WHERE i.merchant_id=?1 AND p.height IS NOT NULL",
         [mid],
         |r| r.get(0),
@@ -305,7 +304,7 @@ pub async fn create(
     let (addr, uri, pref) = create_order(&st, &q)?;
     let (id, t) = (uuid::Uuid::new_v4().to_string(), now());
     {
-        let db = st.db.lock().unwrap();
+        let db = st.db.lk();
         db.execute(
             "INSERT INTO withdrawals(id,merchant_id,provider,status,amount_zat,fiat_currency,fiat_amount,rate_zec_fiat,fee_fiat,network_fee_zat,deposit_address,deposit_uri,provider_ref,created_at,updated_at,expires_at)
              VALUES(?1,?2,?3,'awaiting_kyc',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13,?14)",
@@ -409,7 +408,7 @@ pub struct Lim {
 
 pub async fn list(State(st): S, h: HeaderMap, Query(q): Query<Lim>) -> R {
     let mid = auth(&st, &h)?;
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let ids: Vec<String> = db
         .prepare("SELECT id FROM withdrawals WHERE merchant_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2")?
         .query_map(params![mid, q.limit.unwrap_or(50).clamp(1, 200)], |r| r.get(0))?
@@ -474,7 +473,7 @@ mod tests {
     fn apply_logs_and_guards() {
         let st = test_st();
         {
-            let db = st.db.lock().unwrap();
+            let db = st.db.lk();
             db.execute("INSERT INTO merchants(email,password_hash,name,webhook_secret) VALUES('a@b.c','x','n','s')", []).unwrap();
             db.execute("INSERT INTO withdrawals VALUES('w',1,'mock','awaiting_kyc',1,'USD','1.00','1','0','0',?1,'u',NULL,NULL,0,0,1)", [MOCK_ADDR]).unwrap();
         }
@@ -493,8 +492,7 @@ mod tests {
         assert!(!apply(&st, "w", "deposit_received", "d", None, None).unwrap());
         let n: i64 = st
             .db
-            .lock()
-            .unwrap()
+            .lk()
             .query_row("SELECT COUNT(*) FROM withdrawal_events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2);

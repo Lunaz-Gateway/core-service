@@ -35,6 +35,16 @@ pub struct St {
     pub ws_per: Mutex<std::collections::HashMap<String, usize>>,
 }
 
+/// Lock that survives a panic in another holder (std Mutex poisoning).
+pub trait Lk<T> {
+    fn lk(&self) -> std::sync::MutexGuard<'_, T>;
+}
+impl<T> Lk<T> for Mutex<T> {
+    fn lk(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 pub fn truthy(v: Option<String>) -> bool {
     v.is_some_and(|v| {
         matches!(
@@ -523,6 +533,20 @@ pub mod tests {
             204
         );
         assert_eq!(call(post, "/v1/invoices", &key, inv).await.0, 401);
+    }
+
+    #[test]
+    fn lock_recovers_from_poison() {
+        let m = Arc::new(Mutex::new(1));
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        *m.lk() += 1;
+        assert_eq!(*m.lk(), 2);
     }
 
     #[test]

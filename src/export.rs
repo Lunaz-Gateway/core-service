@@ -3,6 +3,7 @@ use crate::account::{auth, S};
 use crate::api::{bad, AppErr};
 use crate::swap::iso;
 use crate::watcher::IRONWOOD_IDX;
+use crate::Lk;
 use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, StatusCode},
@@ -45,7 +46,7 @@ pub async fn export_csv(
     let mid = auth(&st, &h)?;
     let kind = q.kind.as_deref().unwrap_or("invoices");
     let (from, to) = (q.from.unwrap_or(0), q.to.unwrap_or(i64::MAX));
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let mut out = String::new();
     match kind {
         "invoices" => {

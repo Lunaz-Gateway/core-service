@@ -1,4 +1,4 @@
-use crate::{now, St};
+use crate::{now, Lk, St};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -146,7 +146,7 @@ pub async fn create_invoice(
         return Err(bad(StatusCode::BAD_REQUEST, "invalid amount_zat"));
     }
     let ttl = b.expires_in_secs.unwrap_or(900).clamp(60, 86400);
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let kh = sha_hex(key);
     let mid: i64 = db
         .query_row("UPDATE api_keys SET last_used_at=?1 WHERE key_hash=?2 AND revoked_at IS NULL RETURNING merchant_id", params![now(), kh], |r| r.get(0))
@@ -193,8 +193,7 @@ pub fn new_invoice(
 
 fn status_of(st: &St, id: &str) -> rusqlite::Result<Option<String>> {
     st.db
-        .lock()
-        .unwrap()
+        .lk()
         .query_row("SELECT status FROM invoices WHERE id=?1", [id], |r| {
             r.get(0)
         })
@@ -202,7 +201,7 @@ fn status_of(st: &St, id: &str) -> rusqlite::Result<Option<String>> {
 }
 
 pub async fn get_invoice(State(st): State<Arc<St>>, Path(id): Path<String>) -> R {
-    let db = st.db.lock().unwrap();
+    let db = st.db.lk();
     let mut v = db
         .query_row(
             "SELECT status, amount_zat, expires_at, txid, (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id AND height IS NOT NULL), address,
@@ -238,7 +237,7 @@ struct WsSlot {
 impl WsSlot {
     fn take(st: &Arc<St>, id: &str) -> Option<WsSlot> {
         let permit = st.ws.clone().try_acquire_owned().ok()?;
-        let mut m = st.ws_per.lock().unwrap();
+        let mut m = st.ws_per.lk();
         let n = m.entry(id.to_string()).or_default();
         if *n >= WS_PER_INVOICE {
             return None;
@@ -254,7 +253,7 @@ impl WsSlot {
 
 impl Drop for WsSlot {
     fn drop(&mut self) {
-        let mut m = self.st.ws_per.lock().unwrap();
+        let mut m = self.st.ws_per.lk();
         if let Some(n) = m.get_mut(&self.id) {
             *n -= 1;
             if *n == 0 {
@@ -291,8 +290,7 @@ async fn watch(st: Arc<St>, id: String, mut sock: WebSocket) -> anyhow::Result<(
     loop {
         let sw: Option<String> = st
             .db
-            .lock()
-            .unwrap()
+            .lk()
             .query_row("SELECT status FROM swaps WHERE invoice_id=?1", [&id], |r| {
                 r.get(0)
             })
@@ -405,7 +403,7 @@ mod tests {
         v.pop();
         assert!(WsSlot::take(&st, "a").is_some());
         v.clear();
-        assert!(st.ws_per.lock().unwrap().is_empty());
+        assert!(st.ws_per.lk().is_empty());
         assert_eq!(st.ws.available_permits(), 2000);
     }
 
