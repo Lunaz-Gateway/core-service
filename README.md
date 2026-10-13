@@ -30,6 +30,9 @@ Non-custodial shielded Zcash payment gateway. Merchants sign up, register a Unif
 | `LUNAZ_OFFRAMP` | `mock` | off-ramp provider: `mock` or `transfi` (not implemented yet: off-ramp requests return 501) |
 | `LUNAZ_MOCK_FX` | `{"IDR":16400,"USD":1}` | mock only: USD -> fiat rates (indicative), also defines the supported currencies |
 | `LUNAZ_MOCK_ZEC_USD` | unset | mock only: fixed ZEC/USD price instead of the 1Click price |
+| `LUNAZ_PLANS` | built-in table below | JSON array `[{id,name,price_usd,invoices_per_month,api_keys}]` replacing the plans (`null` = unlimited / not purchasable); must include `free` |
+| `LUNAZ_BILLING_MERCHANT_ID` | unset | id of the treasury merchant that receives subscription payments; unset = purchase endpoints return 503 `billing not configured` |
+| `LUNAZ_BILLING_SANDBOX` | unset | `1` enables `simulate-paid` (demos/tests) |
 | `RUST_LOG` | tracing default | log filter |
 
 ## Run locally
@@ -91,7 +94,7 @@ JSON; errors are `{"error": ...}`. Session token: `Authorization: Bearer <token>
 
 ### Account (session auth)
 
-- `GET /v1/account` -> `{id, email, name, network, ufvk_set, webhook_url}`
+- `GET /v1/account` -> `{id, email, name, network, ufvk_set, webhook_url, plan}`
 - `PUT /v1/account/ufvk` `{ufvk}` -> 204; set once, 409 if already set
 - `GET /v1/account/api-keys`; `POST` `{name}` -> 201 `{id, name, prefix, key}` (key shown once); `DELETE /v1/account/api-keys/{id}` -> 204 (revoke)
 - `GET /v1/account/invoices?limit=50` (max 200) -> `[{id, status, amount_zat, received_zat, overpaid_zat, address, txid, created_at, expires_at, paid_at}]`
@@ -144,6 +147,29 @@ Mock mode: ZEC/USD is the cached 1Click price, USD -> fiat is `LUNAZ_MOCK_FX` (i
 - `POST /v1/account/withdrawals/{id}/cancel`: only before `deposit_received`. Illegal transitions return 409.
 
 Statuses: `quote` (never stored) -> `awaiting_kyc` -> `awaiting_deposit` -> `deposit_received` -> `converting` -> `payout_processing` -> `completed`; also `expired` (quote or deposit window passed, swept every 10 s), `failed`, `cancelled`. Every change is logged as an event and sent to the merchant webhook as `withdrawal.updated` (`{type, invoice_id: null, withdrawal_id, status, amount_zat, fiat_currency, fiat_amount}`), signed and retried like the invoice events.
+
+### Plans and billing
+
+All features are on every plan; only volume is limited. Existing merchants are on `free`.
+
+| Plan | USD / month | Invoices / month | API keys |
+|---|---|---|---|
+| `free` | 0 | 100 | 2 |
+| `pro` | 29 | 5000 | 10 |
+| `platform` | 199 | unlimited | 50 |
+| `enterprise` | contact us | unlimited | unlimited |
+
+- Limits: `POST /v1/invoices` counts invoices created in the current UTC calendar month (billing invoices excluded); `POST /v1/account/api-keys` counts active keys. Over the limit -> 402 `{error, limit, used, plan}`.
+- A plan is effective until `plan_expires_at`; after that the merchant is on `free`. The 10 s sweep resets the stored plan and sends the `plan.updated` webhook `{type, invoice_id: null, plan, expires_at}`.
+- ZEC billing is dogfooded: the treasury (`LUNAZ_BILLING_MERCHANT_ID`) is an ordinary Lunaz merchant with a UFVK. A checkout creates a normal invoice on it (memo `lunaz:billing:<subscription id>`, 30 min), priced `ceil(price_usd * months / zec_usd * 1e8)` zat with the cached 1Click ZEC price (`LUNAZ_MOCK_ZEC_USD` as fallback; 503 without a price). The invoice is public like any other (`GET /v1/invoices/{id}`, WebSocket).
+- When that invoice turns `paid` the subscription is paid, the plan runs for `months * 30` days from `max(now, current expiry)` if it is the same still-active plan, otherwise from now. Underpaid or expired -> subscription `expired` (a late top-up to the full amount still activates it).
+- No proration: switching to another paid plan starts the new plan now and replaces the old one. Renewals are manual payments; nothing is charged automatically.
+- `GET /v1/plans` (public) -> `[{id, name, price_usd, invoices_per_month, api_keys}]`
+- `GET /v1/account/plan` -> `{plan, plan_name, expires_at, limits: {invoices_per_month, api_keys}, usage: {invoices_this_month, api_keys_active}, period_start_of_month, sandbox_billing, billing_configured}`
+- `POST /v1/account/billing/checkout` `{plan, months: 1|3|12}` -> `{subscription_id, plan, months, price_usd, amount_zat, zec_usd, invoice: {id, address, zip321_uri, expires_at, status}}`. 400 for `free`, `enterprise`, unknown plans or the treasury itself.
+- `GET /v1/account/billing` -> newest first `[{id, plan, months, price_usd, amount_zat, zec_usd, invoice_id, status (pending|paid|expired|cancelled), invoice_status, created_at, paid_at, period_start, period_end}]`
+- `POST /v1/account/billing/{subscription_id}/simulate-paid` -> `{status: "paid"}`; only with `LUNAZ_BILLING_SANDBOX=1`, 404 otherwise.
+- `GET /v1/account` also returns `plan`.
 
 ### Export (session auth)
 
