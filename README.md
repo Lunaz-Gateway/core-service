@@ -118,7 +118,7 @@ Sign-in is delegated to an identity provider (Magic, magic.link; email only). Th
 
 - `GET /v1/account` -> `{id, email, name, network, viewing_key_set, ufvk_set, webhook_url, plan}` (`name` may be empty)
 - `PUT /v1/account` `{name}` (1-80 chars) -> 204
-- `PUT /v1/account/viewing-key` `{viewing_key}` -> 204; set once, 409 if already set or used by another account. Accepts a UIVK (`uivk...`) or a UFVK (`uview...`); a UFVK is reduced to its UIVK and only the UIVK is stored. `PUT /v1/account/ufvk` is the legacy alias and also accepts `{ufvk}`.
+- `PUT /v1/account/viewing-key` `{viewing_key}` -> 204; set once, 409 if already set or used by another account (`viewing key is already used by another account`). Duplicates are detected by wallet, not by string: `merchants.orchard_ivk_hash` (SHA-256 of the Orchard incoming viewing key bytes) is UNIQUE, so the same wallet re-encoded (e.g. an Orchard-only UIVK) is refused too. Accepts a UIVK (`uivk...`) or a UFVK (`uview...`); a UFVK is reduced to its UIVK and only the UIVK is stored. `PUT /v1/account/ufvk` is the legacy alias and also accepts `{ufvk}`.
 - `GET /v1/account/api-keys`; `POST` `{name}` -> 201 `{id, name, prefix, key}` (key shown once); `DELETE /v1/account/api-keys/{id}` -> 204 (revoke)
 - `GET /v1/account/invoices?limit=50` (max 200) -> `[{id, status, amount_zat, received_zat, pending_zat, overpaid_zat, address, txid, created_at, expires_at, paid_at}]`
 
@@ -220,4 +220,4 @@ All features are on every plan; only volume is limited. Existing merchants are o
 - Chain reorgs are not handled.
 - Exchange limits and swap request limits are in memory: lost on restart, not shared between instances. Run a single instance.
 - Swaps need an invoice of about 0.001 ZEC (100000 zat) or more.
-- The viewing key cannot be changed once set. Databases from older versions are migrated on startup: stored UFVKs are converted to UIVKs in place (invoice addresses stay valid).
+- The viewing key cannot be changed once set. Databases from older versions are migrated on startup: stored UFVKs are converted to UIVKs in place (invoice addresses stay valid). `orchard_ivk_hash` is backfilled for existing merchants (the count is logged). If two existing accounts already share a wallet, startup continues: a WARN names both merchant ids and the later one keeps a NULL hash until resolved by hand.

@@ -159,6 +159,7 @@ fn migrate(db: &Connection, net: &Network) -> rusqlite::Result<()> {
         ("webhook_deliveries", "event_id", "TEXT"),
         ("payments", "seen_at", "INTEGER"),
         ("invoices", "extended_at", "INTEGER"),
+        ("merchants", "orchard_ivk_hash", "TEXT"),
     ] {
         let has: bool = db.query_row(
             "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name=?2",
@@ -189,6 +190,43 @@ fn migrate(db: &Connection, net: &Network) -> rusqlite::Result<()> {
     }
     if n > 0 {
         tracing::info!("converted {n} stored UFVK(s) to UIVK");
+    }
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS merchants_orchard_ivk ON merchants(orchard_ivk_hash)",
+        [],
+    )?;
+    let rows: Vec<(i64, String)> = db
+        .prepare("SELECT id, ufvk FROM merchants WHERE ufvk IS NOT NULL AND orchard_ivk_hash IS NULL ORDER BY id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut n = 0;
+    for (id, k) in rows {
+        let h = match api::parse_viewing_key(net, &k) {
+            Ok(u) => api::orchard_ivk_hash(&u),
+            Err(e) => {
+                tracing::warn!("merchant {id}: viewing key not hashed: {e}");
+                continue;
+            }
+        };
+        match db.execute(
+            "UPDATE merchants SET orchard_ivk_hash=?1 WHERE id=?2",
+            rusqlite::params![h, id],
+        ) {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                let other: i64 = db.query_row(
+                    "SELECT id FROM merchants WHERE orchard_ivk_hash=?1",
+                    [&h],
+                    |r| r.get(0),
+                )?;
+                tracing::warn!("merchants {other} and {id} use the same wallet; merchant {id} left without orchard_ivk_hash, resolve by hand");
+            }
+            r => n += r?,
+        }
+    }
+    if n > 0 {
+        tracing::info!("backfilled orchard_ivk_hash for {n} merchant(s)");
     }
     Ok(())
 }
@@ -319,7 +357,7 @@ async fn shutdown() {
 pub mod tests {
     use super::*;
     use serde_json::{json, Value};
-    use zcash_keys::keys::UnifiedSpendingKey;
+    use zcash_keys::keys::{UnifiedIncomingViewingKey, UnifiedSpendingKey};
     use zip32::AccountId;
 
     pub fn test_st() -> Arc<St> {
@@ -446,6 +484,27 @@ pub mod tests {
             .0,
             409
         );
+        // Orchard-only UIVK of the same wallet encodes differently but is the same wallet.
+        let only = UnifiedIncomingViewingKey::new(
+            None,
+            UnifiedIncomingViewingKey::decode(&net, &uivk)
+                .unwrap()
+                .orchard()
+                .clone(),
+        )
+        .encode(&net);
+        assert_ne!(only, uivk);
+        let (s, v) = call(
+            reqwest::Method::PUT,
+            "/v1/account/viewing-key",
+            &tok2,
+            json!({"viewing_key": only}),
+        )
+        .await;
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (409, Some("viewing key is already used by another account"))
+        );
         assert_eq!(
             call(post.clone(), "/v1/invoices", &key, inv.clone())
                 .await
@@ -485,6 +544,47 @@ pub mod tests {
             ["LUNAZ_BILLING_SANDBOX", "LUNAZ_WEBHOOK_ALLOW_PRIVATE"]
         );
         assert!(dev_options(&e(&[("LUNAZ_BILLING_SANDBOX", "0")]), false).is_empty());
+    }
+
+    #[test]
+    fn migrate_backfills_ivk_hash() {
+        let net = Network::TestNetwork;
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        let full = UnifiedSpendingKey::from_seed(&net, &[3u8; 32], AccountId::ZERO)
+            .unwrap()
+            .to_unified_full_viewing_key()
+            .to_unified_incoming_viewing_key();
+        let only = UnifiedIncomingViewingKey::new(None, full.orchard().clone());
+        let other = UnifiedSpendingKey::from_seed(&net, &[4u8; 32], AccountId::ZERO)
+            .unwrap()
+            .to_unified_full_viewing_key()
+            .to_unified_incoming_viewing_key();
+        for (e, k) in [("a", &full), ("b", &only), ("c", &other)] {
+            db.execute(
+                "INSERT INTO merchants(email,password_hash,name,ufvk,webhook_secret) VALUES(?1,'','',?2,'')",
+                [e, &k.encode(&net)],
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            migrate(&db, &net).unwrap(); // a collision does not fail startup
+            let h: Vec<Option<String>> = db
+                .prepare("SELECT orchard_ivk_hash FROM merchants ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                h,
+                [
+                    Some(api::orchard_ivk_hash(&full)),
+                    None,
+                    Some(api::orchard_ivk_hash(&other))
+                ]
+            );
+        }
     }
 
     #[test]

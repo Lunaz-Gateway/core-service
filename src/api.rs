@@ -94,6 +94,15 @@ pub fn parse_viewing_key(net: &Network, s: &str) -> anyhow::Result<UnifiedIncomi
     Ok(u)
 }
 
+/// Wallet identity for duplicate detection: the Orchard incoming viewing key, whatever else the UIVK carries.
+pub fn orchard_ivk_hash(u: &UnifiedIncomingViewingKey) -> String {
+    let ivk = u
+        .orchard()
+        .as_ref()
+        .expect("parse_viewing_key requires Orchard");
+    hex::encode(Sha256::digest(ivk.to_bytes()))
+}
+
 // Invoice addresses live far above the low indices the merchant's own wallet hands out.
 pub const INDEX_BASE: u128 = 1 << 80;
 
