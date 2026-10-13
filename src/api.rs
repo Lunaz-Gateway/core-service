@@ -349,7 +349,7 @@ mod tests {
     fn address_roundtrip() {
         let net = Network::TestNetwork;
         let ufvk = fvk(&net, 7);
-        let uivk = parse_viewing_key(&net, &ufvk.encode(&net)).unwrap();
+        let uivk = parse_viewing_key(&net, &ufvk.encode(&net).unwrap()).unwrap();
         let addr = invoice_address(&net, &uivk, 5).unwrap();
         let ua = match zcash_keys::address::Address::decode(&net, &addr).unwrap() {
             zcash_keys::address::Address::Unified(u) => u,
@@ -376,13 +376,14 @@ mod tests {
         for net in [Network::TestNetwork, Network::MainNetwork] {
             let ufvk = fvk(&net, 9);
             let uivk = ufvk.to_unified_incoming_viewing_key();
-            let parsed = parse_viewing_key(&net, &uivk.encode(&net)).unwrap();
-            assert_eq!(parsed.encode(&net), uivk.encode(&net));
+            let parsed = parse_viewing_key(&net, &uivk.encode(&net).unwrap()).unwrap();
+            assert_eq!(parsed.encode(&net).unwrap(), uivk.encode(&net).unwrap());
             assert_eq!(
-                parse_viewing_key(&net, &ufvk.encode(&net))
+                parse_viewing_key(&net, &ufvk.encode(&net).unwrap())
                     .unwrap()
-                    .encode(&net),
-                uivk.encode(&net)
+                    .encode(&net)
+                    .unwrap(),
+                uivk.encode(&net).unwrap()
             );
             for n in [0u64, 1, 5, 1000, u32::MAX as u64] {
                 let idx = DiversifierIndex::try_from(INDEX_BASE + n as u128).unwrap();
@@ -413,11 +414,14 @@ mod tests {
     #[test]
     fn rejects_bad_keys() {
         let (t, m) = (Network::TestNetwork, Network::MainNetwork);
-        let uivk = fvk(&t, 3).to_unified_incoming_viewing_key().encode(&t);
+        let uivk = fvk(&t, 3)
+            .to_unified_incoming_viewing_key()
+            .encode(&t)
+            .unwrap();
         let e = |net, s: &str| parse_viewing_key(net, s).unwrap_err().to_string();
         assert!(uivk.starts_with("uivktest"));
         assert!(e(&m, &uivk).contains("different network"));
-        assert!(e(&m, &fvk(&t, 3).encode(&t)).contains("different network"));
+        assert!(e(&m, &fvk(&t, 3).encode(&t).unwrap()).contains("different network"));
         assert!(e(&t, "garbage").starts_with("invalid viewing key"));
     }
 }

@@ -372,6 +372,20 @@ mod tests {
     use super::*;
     use axum::{routing::post, Router};
 
+    // NU7 keeps the NU6.3 v6 layout: Orchard (V2 notes) + Ironwood (V3 notes), both already scanned.
+    #[test]
+    fn nu7_testnet_branch() {
+        let b = BranchId::for_height(
+            &zcash_protocol::consensus::TEST_NETWORK,
+            BlockHeight::from_u32(4_465_026),
+        );
+        assert_eq!((b, u32::from(b)), (BranchId::Nu7, 0x7719_0ad9));
+        assert_eq!(
+            b.orchard_protocol_revision(),
+            BranchId::Nu6_3.orchard_protocol_revision()
+        );
+    }
+
     #[test]
     fn status_transitions() {
         let n = next_status;

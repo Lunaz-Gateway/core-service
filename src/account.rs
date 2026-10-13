@@ -157,11 +157,14 @@ pub async fn set_ufvk(State(st): S, h: HeaderMap, Json(b): Json<SetUfvk>) -> NoB
     // Only the incoming key is stored (a UFVK is reduced to its UIVK).
     let u = parse_viewing_key(&st.net, &b.viewing_key)
         .map_err(|e| bad(StatusCode::BAD_REQUEST, &e.to_string()))?;
+    let enc = u
+        .encode(&st.net)
+        .map_err(|e| bad(StatusCode::BAD_REQUEST, &e.to_string()))?;
     // Conditional update keeps set-once atomic.
     // Two accounts sharing a wallet would derive identical invoice addresses; UNIQUE(orchard_ivk_hash) also catches a re-encoded key.
     let n = match st.db.lk().execute(
         "UPDATE merchants SET ufvk=?1, orchard_ivk_hash=?3 WHERE id=?2 AND ufvk IS NULL",
-        params![u.encode(&st.net), mid, crate::api::orchard_ivk_hash(&u)],
+        params![enc, mid, crate::api::orchard_ivk_hash(&u)],
     ) {
         Err(rusqlite::Error::SqliteFailure(e, _))
             if e.code == rusqlite::ErrorCode::ConstraintViolation =>

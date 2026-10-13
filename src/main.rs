@@ -233,11 +233,11 @@ fn migrate(db: &Connection, net: &Network) -> rusqlite::Result<()> {
         .collect::<Result<_, _>>()?;
     let mut n = 0;
     for (id, k) in rows {
-        match api::parse_viewing_key(net, &k) {
+        match api::parse_viewing_key(net, &k).and_then(|u| Ok(u.encode(net)?)) {
             Ok(u) => {
                 db.execute(
                     "UPDATE merchants SET ufvk=?1 WHERE id=?2",
-                    rusqlite::params![u.encode(net), id],
+                    rusqlite::params![u, id],
                 )?;
                 n += 1;
             }
@@ -513,7 +513,8 @@ pub mod tests {
         let ufvk = UnifiedSpendingKey::from_seed(&net, &[7u8; 32], AccountId::ZERO)
             .unwrap()
             .to_unified_full_viewing_key()
-            .encode(&net);
+            .encode(&net)
+            .unwrap();
         assert_eq!(
             call(
                 reqwest::Method::PUT,
@@ -530,7 +531,8 @@ pub mod tests {
             .unwrap()
             .to_unified_full_viewing_key()
             .to_unified_incoming_viewing_key()
-            .encode(&net);
+            .encode(&net)
+            .unwrap();
         let (_, v3) = call(
             post.clone(),
             "/v1/auth/exchange",
@@ -557,8 +559,13 @@ pub mod tests {
                 .unwrap()
                 .orchard()
                 .clone(),
+            vec![],
+            None,
+            None,
+            vec![],
         )
-        .encode(&net);
+        .encode(&net)
+        .unwrap();
         assert_ne!(only, uivk);
         let (s, v) = call(
             reqwest::Method::PUT,
@@ -694,7 +701,14 @@ pub mod tests {
             .unwrap()
             .to_unified_full_viewing_key()
             .to_unified_incoming_viewing_key();
-        let only = UnifiedIncomingViewingKey::new(None, full.orchard().clone());
+        let only = UnifiedIncomingViewingKey::new(
+            None,
+            full.orchard().clone(),
+            vec![],
+            None,
+            None,
+            vec![],
+        );
         let other = UnifiedSpendingKey::from_seed(&net, &[4u8; 32], AccountId::ZERO)
             .unwrap()
             .to_unified_full_viewing_key()
@@ -702,7 +716,7 @@ pub mod tests {
         for (e, k) in [("a", &full), ("b", &only), ("c", &other)] {
             db.execute(
                 "INSERT INTO merchants(email,password_hash,name,ufvk,webhook_secret) VALUES(?1,'','',?2,'')",
-                [e, &k.encode(&net)],
+                [e, &k.encode(&net).unwrap()],
             )
             .unwrap();
         }
@@ -736,7 +750,7 @@ pub mod tests {
             .to_unified_full_viewing_key();
         db.execute(
             "INSERT INTO merchants(email,password_hash,name,ufvk,webhook_secret) VALUES('a','','',?1,'')",
-            [fvk.encode(&net)],
+            [fvk.encode(&net).unwrap()],
         )
         .unwrap();
         for _ in 0..2 {
@@ -744,7 +758,10 @@ pub mod tests {
             let k: String = db
                 .query_row("SELECT ufvk FROM merchants", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(k, fvk.to_unified_incoming_viewing_key().encode(&net));
+            assert_eq!(
+                k,
+                fvk.to_unified_incoming_viewing_key().encode(&net).unwrap()
+            );
         }
     }
 }
