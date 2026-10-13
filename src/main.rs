@@ -1,5 +1,6 @@
 mod account;
 mod api;
+mod billing;
 mod export;
 mod hook;
 mod limit;
@@ -27,6 +28,7 @@ pub struct St {
     pub limits: limit::Limiter,
     pub zec_price: Mutex<Option<f64>>,
     pub off: offramp::Cfg,
+    pub bill: billing::Cfg,
 }
 
 pub fn now() -> i64 {
@@ -58,6 +60,14 @@ pub fn app(st: Arc<St>) -> Router {
         .route(
             "/v1/account/webhook/deliveries",
             get(account::list_deliveries),
+        )
+        .route("/v1/plans", get(billing::plans))
+        .route("/v1/account/plan", get(billing::my_plan))
+        .route("/v1/account/billing", get(billing::list))
+        .route("/v1/account/billing/checkout", post(billing::checkout))
+        .route(
+            "/v1/account/billing/{id}/simulate-paid",
+            post(billing::simulate_paid),
         )
         .route("/v1/account/invoices", get(account::list_invoices))
         .route("/v1/account/export.csv", get(export::export_csv))
@@ -106,17 +116,27 @@ CREATE TABLE IF NOT EXISTS withdrawals(id TEXT PRIMARY KEY, merchant_id INTEGER 
   deposit_address TEXT NOT NULL, deposit_uri TEXT NOT NULL, bank_label TEXT, provider_ref TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS withdrawals_merchant ON withdrawals(merchant_id, created_at);
 CREATE TABLE IF NOT EXISTS withdrawal_events(id INTEGER PRIMARY KEY, withdrawal_id TEXT NOT NULL, status TEXT NOT NULL, note TEXT NOT NULL, created_at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS withdrawal_events_w ON withdrawal_events(withdrawal_id, id);";
+CREATE INDEX IF NOT EXISTS withdrawal_events_w ON withdrawal_events(withdrawal_id, id);
+CREATE TABLE IF NOT EXISTS subscriptions(id TEXT PRIMARY KEY, merchant_id INTEGER NOT NULL, plan TEXT NOT NULL, months INTEGER NOT NULL, price_usd REAL NOT NULL,
+  amount_zat INTEGER NOT NULL, zec_usd REAL NOT NULL, invoice_id TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, paid_at INTEGER, period_start INTEGER, period_end INTEGER);
+CREATE INDEX IF NOT EXISTS subscriptions_invoice ON subscriptions(invoice_id);
+CREATE INDEX IF NOT EXISTS subscriptions_merchant ON subscriptions(merchant_id, created_at);";
 
 /// Idempotent column additions for databases created by older versions.
 fn migrate(db: &Connection) -> rusqlite::Result<()> {
-    let has: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM pragma_table_info('invoices') WHERE name='paid_usd_rate'",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has {
-        db.execute("ALTER TABLE invoices ADD COLUMN paid_usd_rate REAL", [])?;
+    for (table, col, ddl) in [
+        ("invoices", "paid_usd_rate", "REAL"),
+        ("merchants", "plan", "TEXT NOT NULL DEFAULT 'free'"),
+        ("merchants", "plan_expires_at", "INTEGER"),
+    ] {
+        let has: bool = db.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name=?2",
+            [table, col],
+            |r| r.get(0),
+        )?;
+        if !has {
+            db.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {ddl}"), [])?;
+        }
     }
     Ok(())
 }
@@ -158,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
         limits: Default::default(),
         zec_price: Mutex::new(None),
         off: offramp::Cfg::from_env(env)?,
+        bill: billing::Cfg::from_env(env)?,
     });
 
     tokio::spawn(watcher::scanner(st.clone()));
@@ -208,6 +229,7 @@ pub mod tests {
             limits: Default::default(),
             zec_price: Mutex::new(None),
             off: Default::default(),
+            bill: Default::default(),
         })
     }
 

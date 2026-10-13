@@ -19,26 +19,38 @@ use zcash_protocol::{consensus::Network, memo::MemoBytes, value::Zatoshis};
 use zip32::DiversifierIndex;
 use zip321::{Payment, TransactionRequest};
 
-pub struct AppErr(StatusCode, String);
+pub struct AppErr(StatusCode, String, Value);
 impl IntoResponse for AppErr {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({"error": self.1}))).into_response()
+        let mut b = json!({"error": self.1});
+        if let (Some(m), Some(x)) = (b.as_object_mut(), self.2.as_object()) {
+            m.extend(x.clone());
+        }
+        (self.0, Json(b)).into_response()
     }
 }
 impl<E: Into<anyhow::Error>> From<E> for AppErr {
     fn from(e: E) -> Self {
         let e: anyhow::Error = e.into();
         tracing::error!("{e:#}");
-        AppErr(StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        AppErr(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".into(),
+            Value::Null,
+        )
     }
 }
 impl AppErr {
     pub fn new(c: StatusCode, m: String) -> Self {
-        AppErr(c, m)
+        AppErr(c, m, Value::Null)
+    }
+    /// Error with extra top-level JSON fields.
+    pub fn with(c: StatusCode, m: String, extra: Value) -> Self {
+        AppErr(c, m, extra)
     }
 }
 pub fn bad(c: StatusCode, m: &str) -> AppErr {
-    AppErr(c, m.into())
+    AppErr(c, m.into(), Value::Null)
 }
 pub type R = Result<Json<Value>, AppErr>;
 
@@ -101,15 +113,28 @@ pub async fn create_invoice(
         return Err(bad(StatusCode::BAD_REQUEST, "invalid amount_zat"));
     }
     let ttl = b.expires_in_secs.unwrap_or(900).clamp(60, 86400);
-    let id = uuid::Uuid::new_v4().to_string();
-    let (created, expires) = (now(), now() + ttl);
     let db = st.db.lock().unwrap();
-    // Allocation and insert share one lock, so a failed insert cannot burn an index unnoticed.
     let kh = sha_hex(key);
     let mid: i64 = db
         .query_row("UPDATE api_keys SET last_used_at=?1 WHERE key_hash=?2 AND revoked_at IS NULL RETURNING merchant_id", params![now(), kh], |r| r.get(0))
         .optional()?
         .ok_or_else(|| bad(StatusCode::UNAUTHORIZED, "bad api key"))?;
+    crate::billing::check_invoices(&st, &db, mid)?;
+    Ok(Json(new_invoice(&st, &db, mid, b.amount_zat, ttl, None)?))
+}
+
+/// Allocates the merchant's next diversifier index and inserts a pending invoice; the caller holds the db lock.
+// Allocation and insert share one lock, so a failed insert cannot burn an index unnoticed.
+pub fn new_invoice(
+    st: &St,
+    db: &rusqlite::Connection,
+    mid: i64,
+    amount: u64,
+    ttl: i64,
+    memo: Option<&str>,
+) -> Result<Value, AppErr> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let (created, expires) = (now(), now() + ttl);
     let (ufvk, idx): (String, u64) = db
         .query_row(
             "UPDATE merchants SET next_index=next_index+1 WHERE id=?1 AND ufvk IS NOT NULL RETURNING ufvk, next_index-1",
@@ -119,14 +144,18 @@ pub async fn create_invoice(
         .optional()?
         .ok_or_else(|| bad(StatusCode::BAD_REQUEST, "viewing key not set"))?;
     let address = invoice_address(&st.net, &parse_ufvk(&st.net, &ufvk)?, idx)?;
-    let uri = zip321_uri(&address, b.amount_zat, &format!("lunaz:{id}"))?;
+    let uri = zip321_uri(
+        &address,
+        amount,
+        &memo.map_or(format!("lunaz:{id}"), String::from),
+    )?;
     db.execute(
         "INSERT INTO invoices(id,merchant_id,div_index,address,amount_zat,status,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,'pending',?6,?7)",
-        params![id, mid, idx, address, b.amount_zat, created, expires],
+        params![id, mid, idx, address, amount, created, expires],
     )?;
-    Ok(Json(
-        json!({"id": id, "address": address, "amount_zat": b.amount_zat, "zip321_uri": uri, "status": "pending", "expires_at": expires}),
-    ))
+    Ok(
+        json!({"id": id, "address": address, "amount_zat": amount, "zip321_uri": uri, "status": "pending", "expires_at": expires}),
+    )
 }
 
 fn status_of(st: &St, id: &str) -> rusqlite::Result<Option<String>> {
@@ -143,12 +172,14 @@ pub async fn get_invoice(State(st): State<Arc<St>>, Path(id): Path<String>) -> R
     let db = st.db.lock().unwrap();
     let mut v = db
         .query_row(
-            "SELECT status, amount_zat, expires_at, txid, (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id), address
+            "SELECT status, amount_zat, expires_at, txid, (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id), address,
+             (SELECT 'lunaz:billing:' || id FROM subscriptions WHERE invoice_id=invoices.id)
              FROM invoices WHERE id=?1",
             [&id],
             |r| {
                 let (amount, address) = (r.get::<_, i64>(1)?, r.get::<_, String>(5)?);
-                let uri = zip321_uri(&address, amount as u64, &format!("lunaz:{id}")).ok();
+                let memo = r.get::<_, Option<String>>(6)?.unwrap_or(format!("lunaz:{id}"));
+                let uri = zip321_uri(&address, amount as u64, &memo).ok();
                 Ok(json!({"id": id, "status": r.get::<_, String>(0)?, "amount_zat": amount, "address": address, "zip321_uri": uri,
                     "expires_at": r.get::<_, i64>(2)?, "txid": r.get::<_, Option<String>>(3)?, "received_zat": r.get::<_, i64>(4)?, "overpaid_zat": (r.get::<_, i64>(4)? - amount).max(0)}))
             },

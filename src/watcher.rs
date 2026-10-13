@@ -70,6 +70,7 @@ pub async fn scanner(st: Arc<St>) {
 fn expire(st: &Arc<St>) {
     sweep(st);
     crate::offramp::expire(st);
+    crate::billing::sweep(st);
     let _ = st
         .db
         .lock()
@@ -84,6 +85,7 @@ fn expire(st: &Arc<St>) {
     })()
     .unwrap_or_default();
     for id in ids {
+        let _ = crate::billing::on_invoice(st, &st.db.lock().unwrap(), &id, "expired");
         let _ = st.events.send((id, "expired".into()));
     }
 }
@@ -340,6 +342,7 @@ fn transition(st: &Arc<St>, db: &Connection, id: &str, txid: Option<&str>) -> Re
     if let Some(t) = hook_type(new) {
         crate::hook::notify(st, db, id, t)?;
     }
+    crate::billing::on_invoice(st, db, id, new)?;
     Ok(())
 }
 

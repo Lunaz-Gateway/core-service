@@ -165,10 +165,12 @@ pub async fn account(State(st): S, h: HeaderMap) -> R {
     } else {
         "test"
     };
-    let v = st.db.lock().unwrap().query_row("SELECT id, email, name, ufvk IS NOT NULL, webhook_url FROM merchants WHERE id=?1", [mid], |r| {
+    let db = st.db.lock().unwrap();
+    let mut v = db.query_row("SELECT id, email, name, ufvk IS NOT NULL, webhook_url FROM merchants WHERE id=?1", [mid], |r| {
         Ok(json!({"id": r.get::<_, i64>(0)?, "email": r.get::<_, String>(1)?, "name": r.get::<_, String>(2)?, "network": net,
             "ufvk_set": r.get::<_, bool>(3)?, "webhook_url": r.get::<_, Option<String>>(4)?}))
     })?;
+    v["plan"] = crate::billing::plan_of(&st, &db, mid)?.id.clone().into();
     Ok(Json(v))
 }
 
@@ -232,6 +234,7 @@ pub async fn create_key(
     let key = format!("lz_{}", rand_hex());
     let prefix = &key[..12];
     let db = st.db.lock().unwrap();
+    crate::billing::check_keys(&st, &db, mid)?;
     db.execute(
         "INSERT INTO api_keys(merchant_id,name,prefix,key_hash,created_at) VALUES(?1,?2,?3,?4,?5)",
         params![mid, b.name.trim(), prefix, sha_hex(&key), now()],
