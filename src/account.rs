@@ -5,7 +5,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use hmac::{Hmac, Mac};
 use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -252,14 +251,8 @@ pub struct SetWebhook {
 
 pub async fn set_webhook(State(st): S, h: HeaderMap, Json(b): Json<SetWebhook>) -> NoBody {
     let mid = auth(&st, &h)?;
-    if b.url
-        .as_ref()
-        .is_some_and(|u| !(u.starts_with("http://") || u.starts_with("https://")))
-    {
-        return Err(bad(
-            StatusCode::BAD_REQUEST,
-            "url must start with http:// or https://",
-        ));
+    if let Some(u) = &b.url {
+        crate::hook::check_url(u, &st.hook).map_err(|m| bad(StatusCode::BAD_REQUEST, m))?;
     }
     st.db.lock().unwrap().execute(
         "UPDATE merchants SET webhook_url=?1 WHERE id=?2",
@@ -278,26 +271,6 @@ pub async fn rotate_webhook(State(st): S, h: HeaderMap) -> R {
     Ok(Json(json!({"secret": secret})))
 }
 
-/// Signs `body` with HMAC-SHA256 and POSTs it; returns the HTTP status code.
-pub async fn send_webhook(
-    http: &reqwest::Client,
-    url: &str,
-    secret: &str,
-    body: String,
-) -> anyhow::Result<u16> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
-    mac.update(body.as_bytes());
-    let sig = hex::encode(mac.finalize().into_bytes());
-    let r = http
-        .post(url)
-        .header("content-type", "application/json")
-        .header("X-Lunaz-Signature", sig)
-        .body(body)
-        .send()
-        .await?;
-    Ok(r.status().as_u16())
-}
-
 pub async fn test_webhook(State(st): S, h: HeaderMap) -> Result<(StatusCode, Json<Value>), AppErr> {
     let mid = auth(&st, &h)?;
     let url: Option<String> = st.db.lock().unwrap().query_row(
@@ -306,10 +279,16 @@ pub async fn test_webhook(State(st): S, h: HeaderMap) -> Result<(StatusCode, Jso
         |r| r.get(0),
     )?;
     url.ok_or_else(|| bad(StatusCode::BAD_REQUEST, "webhook url not set"))?;
+    if !st.limits.hit(&format!("whtest:{mid}"), 10, 900, now()) {
+        return Err(bad(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many webhook tests, try again later",
+        ));
+    }
     let body = json!({"type": "test", "invoice_id": null, "status": "paid", "amount_zat": 0, "received_zat": 0, "pending_zat": 0, "overpaid_zat": 0, "txid": null, "swap": null}).to_string();
-    Ok(match crate::hook::send_test(&st, mid, body).await {
+    Ok(match crate::hook::send_test(&st, mid, body).await? {
         Ok(s) => (StatusCode::OK, Json(json!({"status": s}))),
-        Err(e) => (StatusCode::OK, Json(json!({"error": e.to_string()}))),
+        Err(e) => (StatusCode::OK, Json(json!({"error": e}))),
     })
 }
 

@@ -30,8 +30,18 @@ pub struct St {
     pub off: offramp::Cfg,
     pub bill: billing::Cfg,
     pub internal: Option<String>,
+    pub hook: hook::Cfg,
     pub ws: Arc<tokio::sync::Semaphore>,
     pub ws_per: Mutex<std::collections::HashMap<String, usize>>,
+}
+
+pub fn truthy(v: Option<String>) -> bool {
+    v.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 pub fn now() -> i64 {
@@ -210,6 +220,10 @@ async fn main() -> anyhow::Result<()> {
     if internal.as_ref().is_some_and(|t| t.len() < 32) {
         anyhow::bail!("LUNAZ_INTERNAL_TOKEN must be at least 32 characters");
     }
+    let allow_private = truthy(env("LUNAZ_WEBHOOK_ALLOW_PRIVATE"));
+    if allow_private {
+        tracing::warn!("LUNAZ_WEBHOOK_ALLOW_PRIVATE is on: webhooks may target private and loopback addresses (development only)");
+    }
     let db = Connection::open(env("LUNAZ_DB").unwrap_or("lunaz.db".into()))?;
     db.execute_batch(SCHEMA)?;
     migrate(&db, &net)?;
@@ -228,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
         off: offramp::Cfg::from_env(env)?,
         bill: billing::Cfg::from_env(env)?,
         internal,
+        hook: hook::Cfg::new(allow_private, truthy(env("LUNAZ_WEBHOOK_ALLOW_HTTP")))?,
         ws: Arc::new(tokio::sync::Semaphore::new(
             env("LUNAZ_MAX_WS")
                 .and_then(|v| v.parse().ok())
@@ -287,6 +302,7 @@ pub mod tests {
             off: Default::default(),
             bill: Default::default(),
             internal: Some("t".repeat(32)),
+            hook: hook::Cfg::new(true, true).unwrap(),
             ws: Arc::new(tokio::sync::Semaphore::new(2000)),
             ws_per: Default::default(),
         })

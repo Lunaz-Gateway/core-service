@@ -34,6 +34,8 @@ Non-custodial shielded Zcash payment gateway. Merchants sign up, register a Unif
 | `LUNAZ_INTERNAL_TOKEN` | unset | secret (>=32 chars) for `/v1/auth/exchange`; unset = endpoint returns 503; shorter aborts startup |
 | `LUNAZ_BILLING_MERCHANT_ID` | unset | id of the treasury merchant that receives subscription payments; unset = purchase endpoints return 503 `billing not configured` |
 | `LUNAZ_BILLING_SANDBOX` | unset | `1` enables `simulate-paid` (demos/tests) |
+| `LUNAZ_WEBHOOK_ALLOW_HTTP` | unset | `1` also accepts plain `http://` webhook URLs (still public hosts, default port) |
+| `LUNAZ_WEBHOOK_ALLOW_PRIVATE` | unset | development only: `1` allows webhooks to private/loopback addresses, any port, `http` |
 | `LUNAZ_MAX_WS` | `2000` | maximum concurrent invoice WebSockets |
 | `RUST_LOG` | tracing default | log filter |
 
@@ -138,7 +140,9 @@ Statuses: `pending` -> `detected` (seen in mempool or mined) -> `paid` (mined su
 
 ### Webhooks
 
-- `GET /v1/account/webhook` -> `{url, secret}`; `PUT` `{url|null}` -> 204; `POST /v1/account/webhook/rotate` -> `{secret}`; `POST /v1/account/webhook/test` -> `{status}` or `{error}` (single attempt)
+- `GET /v1/account/webhook` -> `{url, secret}`; `PUT` `{url|null}` -> 204, 400 with a reason when the URL breaks the rules below; `POST /v1/account/webhook/rotate` -> `{secret}`; `POST /v1/account/webhook/test` -> `{status: <http code>}` or `{error: "connection failed" | "timed out" | "blocked address" | "invalid URL"}` (single attempt; 429 after 10 per merchant per 15 min)
+- URL rules (checked on save and again at send time): `https` only (`http` too with `LUNAZ_WEBHOOK_ALLOW_HTTP=1`), no `user:pass@`, default port, at most 2048 chars, and the host must not be a private or reserved IP (loopback, 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10, 0/8, 192.0.0/24, 198.18/15, multicast/reserved, IPv6 loopback/ULA/link-local/multicast/documentation, and IPv4 embedded in IPv6). Host names are resolved at send time and the request fails with `blocked address` if any address is not public. Redirects are never followed (a 3xx is recorded as the status). Timeouts: 3 s connect, 5 s total; proxy env vars are ignored.
+- `LUNAZ_WEBHOOK_ALLOW_PRIVATE=1` (development only) lifts the address, port and scheme rules so a local receiver such as `http://127.0.0.1:3000/hook` works; a WARN is logged at startup. On mainnet it needs `LUNAZ_DEV=1`.
 - `GET /v1/account/webhook/events?status=pending|delivered|failed&limit=50` (max 200) -> newest first `[{id, type, invoice_id, status, attempts, max_attempts: 3, next_attempt_at, last_status_code, last_error, created_at, updated_at, deliveries: [{attempt, status_code, error, created_at}]}]`
 - `POST /v1/account/webhook/events/{id}/retry` -> the event, now `pending` with `attempts` 0; 409 unless the event is `failed`, 404 if unknown.
 - `POST /v1/account/webhook/events/retry-failed` -> `{retried: n}`; requeues the failed events of the last 7 days (max 100).
@@ -147,7 +151,7 @@ Statuses: `pending` -> `detected` (seen in mempool or mined) -> `paid` (mined su
 - Body always: `{type, invoice_id, status, amount_zat, received_zat, pending_zat, overpaid_zat, txid, swap}` (invoice events; amounts as for `GET /v1/invoices/{id}`). `swap` is `{asset, blockchain, amount_in_formatted, status}` or null.
 - Types: `invoice.paid`, `invoice.underpaid`, `swap.refunded`, `swap.failed`, `swap.incomplete_deposit` (the swap ones leave the invoice `pending`; the buyer can start another swap or pay ZEC), `withdrawal.updated`, `plan.updated` and `test` (`invoice_id: null`).
 - Events are stored in the database before sending, so pending events survive a restart. A background loop (every 2 s) sends due events. Statuses: `pending` -> `delivered` (any 2xx) | `failed`.
-- 3 attempts in total: immediately, after 10 s, after 60 s. A non-2xx or network error uses up an attempt; after the third the event is `failed` (`next_attempt_at: null`). No webhook URL at send time -> `failed` with `last_error: "no webhook URL configured"`. Events are only created while a URL is set.
+- 3 attempts in total: immediately, after 10 s, after 60 s. A non-2xx or network error uses up an attempt (errors are stored in the same coarse form as the test endpoint returns, never raw network errors); after the third the event is `failed` (`next_attempt_at: null`). No webhook URL at send time -> `failed` with `last_error: "no webhook URL configured"`. Events are only created while a URL is set.
 - `POST /v1/account/webhook/test` makes one synchronous attempt (no retries) and stores a `test` event with its final status.
 - Delivered events are deleted after 30 days, failed ones after 90 days (with their attempt logs).
 
