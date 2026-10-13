@@ -69,6 +69,7 @@ pub async fn scanner(st: Arc<St>) {
 
 fn expire(st: &Arc<St>) {
     sweep(st);
+    crate::offramp::expire(st);
     let _ = st
         .db
         .lock()

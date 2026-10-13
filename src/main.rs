@@ -3,6 +3,7 @@ mod api;
 mod export;
 mod hook;
 mod limit;
+mod offramp;
 mod swap;
 mod watcher;
 
@@ -25,6 +26,7 @@ pub struct St {
     pub assets: Mutex<Option<(i64, Vec<serde_json::Value>)>>,
     pub limits: limit::Limiter,
     pub zec_price: Mutex<Option<f64>>,
+    pub off: offramp::Cfg,
 }
 
 pub fn now() -> i64 {
@@ -59,6 +61,19 @@ pub fn app(st: Arc<St>) -> Router {
         )
         .route("/v1/account/invoices", get(account::list_invoices))
         .route("/v1/account/export.csv", get(export::export_csv))
+        .route("/v1/account/offramp", get(offramp::info))
+        .route("/v1/account/withdrawals/quote", post(offramp::quote_h))
+        .route(
+            "/v1/account/withdrawals",
+            get(offramp::list).post(offramp::create),
+        )
+        .route("/v1/account/withdrawals/{id}", get(offramp::get_one))
+        .route("/v1/account/withdrawals/{id}/kyc", post(offramp::kyc))
+        .route(
+            "/v1/account/withdrawals/{id}/simulate-deposit",
+            post(offramp::simulate_deposit),
+        )
+        .route("/v1/account/withdrawals/{id}/cancel", post(offramp::cancel))
         .route("/v1/invoices", post(api::create_invoice))
         .route("/v1/invoices/{id}", get(api::get_invoice))
         .route("/v1/invoices/{id}/swap", post(swap::create_swap))
@@ -85,7 +100,13 @@ CREATE TABLE IF NOT EXISTS swaps(id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL, 
 CREATE INDEX IF NOT EXISTS swaps_invoice ON swaps(invoice_id);
 CREATE TABLE IF NOT EXISTS webhook_deliveries(id INTEGER PRIMARY KEY, merchant_id INTEGER NOT NULL, invoice_id TEXT, type TEXT NOT NULL, url TEXT NOT NULL,
   status_code INTEGER, error TEXT, attempt INTEGER NOT NULL, created_at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS webhook_deliveries_merchant ON webhook_deliveries(merchant_id, id);";
+CREATE INDEX IF NOT EXISTS webhook_deliveries_merchant ON webhook_deliveries(merchant_id, id);
+CREATE TABLE IF NOT EXISTS withdrawals(id TEXT PRIMARY KEY, merchant_id INTEGER NOT NULL, provider TEXT NOT NULL, status TEXT NOT NULL, amount_zat INTEGER NOT NULL,
+  fiat_currency TEXT NOT NULL, fiat_amount TEXT NOT NULL, rate_zec_fiat TEXT NOT NULL, fee_fiat TEXT NOT NULL, network_fee_zat INTEGER NOT NULL,
+  deposit_address TEXT NOT NULL, deposit_uri TEXT NOT NULL, bank_label TEXT, provider_ref TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS withdrawals_merchant ON withdrawals(merchant_id, created_at);
+CREATE TABLE IF NOT EXISTS withdrawal_events(id INTEGER PRIMARY KEY, withdrawal_id TEXT NOT NULL, status TEXT NOT NULL, note TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS withdrawal_events_w ON withdrawal_events(withdrawal_id, id);";
 
 /// Idempotent column additions for databases created by older versions.
 fn migrate(db: &Connection) -> rusqlite::Result<()> {
@@ -136,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         assets: Mutex::new(None),
         limits: Default::default(),
         zec_price: Mutex::new(None),
+        off: offramp::Cfg::from_env(env)?,
     });
 
     tokio::spawn(watcher::scanner(st.clone()));
@@ -165,7 +187,7 @@ async fn shutdown() {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use serde_json::{json, Value};
     use zcash_keys::keys::UnifiedSpendingKey;
@@ -185,6 +207,7 @@ mod tests {
             assets: Mutex::new(None),
             limits: Default::default(),
             zec_price: Mutex::new(None),
+            off: Default::default(),
         })
     }
 
