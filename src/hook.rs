@@ -160,8 +160,21 @@ fn coarse(e: &reqwest::Error) -> &'static str {
     }
 }
 
-/// Signs `body` with HMAC-SHA256 and POSTs it once; returns the HTTP status (redirects are not followed).
-pub async fn post(cfg: &Cfg, url: &str, secret: &str, body: String) -> Result<u16, &'static str> {
+/// `X-Lunaz-Signature` value: `t=<unix s>,v1=<hex HMAC-SHA256(secret, "{t}.{body}")>`.
+pub fn signature(secret: &str, t: i64, body: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac takes any key");
+    mac.update(format!("{t}.{body}").as_bytes());
+    format!("t={t},v1={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Signs `body` with the current time and POSTs it once; returns the HTTP status (redirects are not followed).
+pub async fn post(
+    cfg: &Cfg,
+    url: &str,
+    secret: &str,
+    event_id: &str,
+    body: String,
+) -> Result<u16, &'static str> {
     let url = check_url(url, cfg).map_err(|m| {
         if m == PRIVATE_IP {
             BLOCKED
@@ -169,14 +182,12 @@ pub async fn post(cfg: &Cfg, url: &str, secret: &str, body: String) -> Result<u1
             "invalid URL"
         }
     })?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| "invalid URL")?;
-    mac.update(body.as_bytes());
-    let sig = hex::encode(mac.finalize().into_bytes());
     let r = cfg
         .http
         .post(url)
         .header("content-type", "application/json")
-        .header("X-Lunaz-Signature", sig)
+        .header("X-Lunaz-Event-Id", event_id)
+        .header("X-Lunaz-Signature", signature(secret, now(), &body))
         .body(body)
         .send()
         .await
@@ -222,6 +233,7 @@ pub fn enqueue(
     Ok(())
 }
 
+/// Stores the event; `id` and `created_at` are added to the JSON object body, which is then sent unchanged on every attempt.
 fn insert(
     db: &Connection,
     mid: i64,
@@ -229,11 +241,18 @@ fn insert(
     typ: &str,
     body: &str,
     next: Option<i64>,
-) -> rusqlite::Result<String> {
+) -> anyhow::Result<String> {
     let id = uuid::Uuid::new_v4().to_string();
+    let t = now();
+    let mut v: serde_json::Value = serde_json::from_str(body)?;
+    let o = v
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("webhook body must be a JSON object"))?;
+    o.insert("id".into(), json!(id));
+    o.insert("created_at".into(), json!(t));
     db.execute(
         "INSERT INTO webhook_events(id,merchant_id,invoice_id,type,body,status,attempts,next_attempt_at,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,'pending',0,?6,?7,?7)",
-        params![id, mid, invoice, typ, body, next, now()],
+        params![id, mid, invoice, typ, v.to_string(), next, t],
     )?;
     Ok(id)
 }
@@ -257,7 +276,7 @@ async fn send(st: &St, id: &str, retry: bool) -> anyhow::Result<Result<u16, &'st
         )?;
         return Ok(Err(e));
     };
-    let r = post(&st.hook, &url, &secret, body).await;
+    let r = post(&st.hook, &url, &secret, id, body).await;
     let ok = matches!(r, Ok(s) if (200..300).contains(&s));
     let err = match r {
         Err(e) => Some(e.to_string()),
@@ -518,7 +537,7 @@ mod tests {
     #[tokio::test]
     async fn strict_blocks_private_targets() {
         let strict = Cfg::new(false, false).unwrap();
-        let b = |u: &'static str| post(&strict, u, "s", "{}".into());
+        let b = |u: &'static str| post(&strict, u, "s", "e", "{}".into());
         assert_eq!(b("https://localhost/").await, Err(BLOCKED)); // resolver
         assert_eq!(b("https://127.0.0.1/").await, Err(BLOCKED));
         assert_eq!(b("https://[::1]/").await, Err(BLOCKED));
@@ -589,7 +608,10 @@ mod tests {
         ))
         .await;
         let dev = Cfg::new(true, false).unwrap();
-        assert_eq!(post(&dev, &a, "s", "{}".into()).await, Err("timed out"));
+        assert_eq!(
+            post(&dev, &a, "s", "e", "{}".into()).await,
+            Err("timed out")
+        );
     }
 
     // A merchant with a slow endpoint holds at most 2 slots and does not delay another merchant.
@@ -682,5 +704,56 @@ mod tests {
             .unwrap();
         assert_eq!((s.as_str(), a), ("pending", 0));
         assert!(n.is_some());
+    }
+
+    #[test]
+    fn signature_format() {
+        let h = signature("whsec", 1700000000, r#"{"a":1}"#);
+        let (t, v1) = h.split_once(',').unwrap();
+        assert_eq!(t, "t=1700000000");
+        let v1 = v1.strip_prefix("v1=").unwrap();
+        assert_eq!(v1.len(), 64);
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"whsec").unwrap();
+        mac.update(br#"1700000000.{"a":1}"#);
+        mac.verify_slice(&hex::decode(v1).unwrap()).unwrap();
+        assert_ne!(h, signature("whsec", 1700000001, r#"{"a":1}"#));
+    }
+
+    // Each attempt carries the same event id and body but is signed with its own send time.
+    #[tokio::test]
+    async fn retries_keep_id_and_body_and_resign() {
+        let seen: Arc<Mutex<Vec<(String, String, String)>>> = Default::default();
+        let s2 = seen.clone();
+        let a = serve(Router::new().route(
+            "/",
+            any(move |h: axum::http::HeaderMap, b: String| {
+                let hv = |k: &str| h.get(k).unwrap().to_str().unwrap().to_string();
+                s2.lk()
+                    .push((hv("x-lunaz-event-id"), hv("x-lunaz-signature"), b));
+                async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }
+            }),
+        ))
+        .await;
+        let st = crate::tests::test_st();
+        st.db.lk().execute("INSERT INTO merchants(id,email,password_hash,name,webhook_url,webhook_secret) VALUES(1,'a','','',?1,'s')", [&a]).unwrap();
+        let id = insert(&st.db.lk(), 1, None, "test", r#"{"type":"test"}"#, None).unwrap();
+        assert_eq!(send(&st, &id, true).await.unwrap(), Ok(500));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(send(&st, &id, true).await.unwrap(), Ok(500));
+        let seen = seen.lk();
+        let [(id1, sig1, b1), (id2, sig2, b2)] = &seen[..] else {
+            panic!("{seen:?}")
+        };
+        assert_eq!((id1, id2), (&id, &id));
+        assert_eq!(b1, b2);
+        let v: serde_json::Value = serde_json::from_str(b1).unwrap();
+        assert_eq!(v["id"], id.as_str());
+        assert_eq!(v["type"], "test");
+        assert!(v["created_at"].as_i64().unwrap() > 0);
+        assert_ne!(sig1, sig2);
+        for sig in [sig1, sig2] {
+            let t: i64 = sig[2..sig.find(',').unwrap()].parse().unwrap();
+            assert_eq!(sig, &signature("s", t, b1));
+        }
     }
 }
