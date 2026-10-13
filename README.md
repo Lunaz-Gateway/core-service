@@ -8,7 +8,7 @@ Non-custodial shielded Zcash payment gateway. Merchants sign up, register a Unif
 - **Watcher.** A scanner reads compact blocks from lightwalletd (gRPC over TLS) and trial-decrypts Orchard and Ironwood actions with every merchant's viewing key. A second task does the same for the mempool, so payments show as `detected` before they are mined.
 - **Cross-chain.** A buyer can pay in another asset through NEAR Intents 1Click. The buyer sends funds on their own chain and 1Click delivers ZEC to the invoice address. The watcher sees the ZEC as usual. Swap status is polled every 10 s.
 - **Webhooks.** Signed POSTs on invoice, swap, withdrawal and plan events. Every event is stored, retried up to 3 times and keeps a final status; failed ones can be retried by hand.
-- **Storage.** One SQLite file (bundled rusqlite). Tables are created on start; older databases are migrated in place.
+- **Storage.** One SQLite file (bundled rusqlite) in WAL mode with a 5 s busy timeout, so the CSV export reads on its own read-only connection while the service keeps writing. Tables and indexes (payments by invoice, invoices by merchant and created_at, invoices by status, API keys by merchant, webhook deliveries by event) are created on start; older databases are migrated in place.
 
 ## Privacy and security model
 
@@ -104,6 +104,14 @@ Common errors:
 
 JSON; errors are `{"error": ...}`. Session token: `Authorization: Bearer <token>`, valid 30 days. The merchant API uses an API key as the Bearer token.
 
+### Limits and headers
+
+- Request bodies: at most 64 KiB, larger -> 413.
+- HTTP requests time out after 15 s -> 503 `request timed out`. The invoice WebSocket has no request timeout (see its own limits).
+- Rate limits (429 with the usual JSON error): `POST /v1/invoices` 60 per minute per API key (on top of the monthly plan quota), CSV export 5 per minute per merchant, `POST /v1/account/withdrawals` 10 per hour per merchant, plus the per-endpoint limits listed below.
+- Input sizes: account name and API key name 1-80 characters, viewing key at most 2048 characters, webhook URL at most 2048, email at most 254, swap `refund_to` 1-128. List `limit` parameters are clamped to 1..200 (default 50); billing history returns at most 200 rows.
+- Every response has `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`. Everything except `GET`/`HEAD` on `/healthz`, `/v1/plans` and `/v1/swap/assets` also has `Cache-Control: no-store`.
+
 ### Auth
 
 Sign-in is delegated to an identity provider (Magic, magic.link; email only). The browser logs in with an email OTP and gets a DID token; the landing server verifies it with `@magic-sdk/admin` and calls the exchange endpoint. core-service never sees provider tokens.
@@ -118,8 +126,8 @@ Sign-in is delegated to an identity provider (Magic, magic.link; email only). Th
 
 - `GET /v1/account` -> `{id, email, name, network, viewing_key_set, ufvk_set, webhook_url, plan}` (`name` may be empty)
 - `PUT /v1/account` `{name}` (1-80 chars) -> 204
-- `PUT /v1/account/viewing-key` `{viewing_key}` -> 204; set once, 409 if already set or used by another account (`viewing key is already used by another account`). Duplicates are detected by wallet, not by string: `merchants.orchard_ivk_hash` (SHA-256 of the Orchard incoming viewing key bytes) is UNIQUE, so the same wallet re-encoded (e.g. an Orchard-only UIVK) is refused too. Accepts a UIVK (`uivk...`) or a UFVK (`uview...`); a UFVK is reduced to its UIVK and only the UIVK is stored. `PUT /v1/account/ufvk` is the legacy alias and also accepts `{ufvk}`.
-- `GET /v1/account/api-keys`; `POST` `{name}` -> 201 `{id, name, prefix, key}` (key shown once); `DELETE /v1/account/api-keys/{id}` -> 204 (revoke)
+- `PUT /v1/account/viewing-key` `{viewing_key}` -> 204; set once (at most 2048 chars), 409 if already set or used by another account (`viewing key is already used by another account`). Duplicates are detected by wallet, not by string: `merchants.orchard_ivk_hash` (SHA-256 of the Orchard incoming viewing key bytes) is UNIQUE, so the same wallet re-encoded (e.g. an Orchard-only UIVK) is refused too. Accepts a UIVK (`uivk...`) or a UFVK (`uview...`); a UFVK is reduced to its UIVK and only the UIVK is stored. `PUT /v1/account/ufvk` is the legacy alias and also accepts `{ufvk}`.
+- `GET /v1/account/api-keys`; `POST` `{name}` (1-80 chars) -> 201 `{id, name, prefix, key}` (key shown once); `DELETE /v1/account/api-keys/{id}` -> 204 (revoke)
 - `GET /v1/account/invoices?limit=50` (max 200) -> `[{id, status, amount_zat, received_zat, pending_zat, overpaid_zat, address, txid, created_at, expires_at, paid_at}]`
 
 ### Invoices
@@ -139,7 +147,7 @@ Statuses: `pending` -> `detected` (seen in mempool or mined) -> `paid` (mined su
 ### Swaps (cross-chain)
 
 - `GET /v1/swap/assets` (public) -> `[{asset_id, symbol, blockchain, decimals, price_usd}]`: USDC/USDT/SOL/ETH/BTC/wNEAR on the main chains, cached 5 min.
-- `POST /v1/invoices/{id}/swap` (public) `{asset_id, refund_to}` -> 201 `{swap_id, deposit_address, deposit_memo, amount_in, amount_in_formatted, amount_in_usd, symbol, blockchain, deadline, time_estimate}`. 409 unless the invoice is pending; 429 after 5 requests per invoice per 10 min; 400 for an unknown asset or a refund address 1Click rejects (its message is passed through).
+- `POST /v1/invoices/{id}/swap` (public) `{asset_id, refund_to}` -> 201 `{swap_id, deposit_address, deposit_memo, amount_in, amount_in_formatted, amount_in_usd, symbol, blockchain, deadline, time_estimate}`. 409 unless the invoice is pending; 429 after 5 requests per invoice per 10 min; 400 for an unknown asset, a `refund_to` over 128 chars, or a quote 1Click rejects. 1Click rejections are mapped to fixed messages (`refund address is not valid for this asset`, `amount is too small to swap with this asset`, `swap quote rejected, try another asset or pay in ZEC`); the raw message is logged only, with the refund address masked.
 - The quote is EXACT_OUTPUT for the invoice amount; 1Click's fee is added to `amount_in`. Minimum invoice for a swap is about 100000 zat.
 - Deadline = min(invoice expiry, now+30 min). If the invoice expires within 10 min, `expires_at` is extended to now+30 min so the swap can finish. This happens at most once per invoice (`invoices.extended_at`) and never past the original expiry + 30 min; after that a swap on an invoice expiring within 10 min gets 409. Billing invoices are never extended: 409, start a new checkout.
 - One active swap per invoice: a new request replaces the old row only while it is `PENDING_DEPOSIT`, `REFUNDED` or `FAILED`, and the old deposit address is abandoned (do not send to it). Otherwise 409 `a swap is already in progress`. This is checked again atomically after the 1Click quote returns, so a swap that received a deposit meanwhile (or a concurrent request) is never dropped; the unused quote simply expires.
@@ -157,7 +165,7 @@ Statuses: `pending` -> `detected` (seen in mempool or mined) -> `paid` (mined su
 - Delivery: POST with header `X-Lunaz-Signature` = hex HMAC-SHA256 of the raw body, keyed with the merchant's current webhook secret (at send time). Compare in constant time.
 - Body always: `{type, invoice_id, status, amount_zat, received_zat, pending_zat, overpaid_zat, txid, swap}` (invoice events; amounts as for `GET /v1/invoices/{id}`). `swap` is `{asset, blockchain, amount_in_formatted, status}` or null.
 - Types: `invoice.paid`, `invoice.underpaid`, `swap.refunded`, `swap.failed`, `swap.incomplete_deposit` (the swap ones leave the invoice `pending`; the buyer can start another swap or pay ZEC), `withdrawal.updated`, `plan.updated` and `test` (`invoice_id: null`).
-- Events are stored in the database before sending, so pending events survive a restart. A background loop (every 2 s) sends due events. Statuses: `pending` -> `delivered` (any 2xx) | `failed`.
+- Events are stored in the database before sending, so pending events survive a restart. A background loop (every 2 s) sends due events concurrently: at most 16 in flight overall and 2 per merchant, so a slow endpoint only delays its own merchant's events. A claimed event is leased for 30 s, so it is never sent twice at once. Statuses: `pending` -> `delivered` (any 2xx) | `failed`.
 - 3 attempts in total: immediately, after 10 s, after 60 s. A non-2xx or network error uses up an attempt (errors are stored in the same coarse form as the test endpoint returns, never raw network errors); after the third the event is `failed` (`next_attempt_at: null`). No webhook URL at send time -> `failed` with `last_error: "no webhook URL configured"`. Events are only created while a URL is set.
 - `POST /v1/account/webhook/test` makes one synchronous attempt (no retries) and stores a `test` event with its final status.
 - Delivered events are deleted after 30 days, failed ones after 90 days (with their attempt logs).
@@ -172,7 +180,7 @@ Mock mode: ZEC/USD is the cached 1Click price, USD -> fiat is `LUNAZ_MOCK_FX` (i
 
 - `GET /v1/account/offramp` -> `{provider, sandbox, currencies, min_zat, received_zat, zec_usd}`. `received_zat` is the sum of mined payments to this merchant's invoices ("received through Lunaz"), not a wallet balance.
 - `POST /v1/account/withdrawals/quote` `{amount_zat, currency}` -> `{amount_zat, currency, rate, fee_fiat, network_fee_zat, fiat_amount, expires_at}`. Not persisted, valid 10 min. 400 below `min_zat` (100000), above 21e14 or for an unsupported currency; 503 without a ZEC price.
-- `POST /v1/account/withdrawals` `{amount_zat, currency}` -> 201 withdrawal `{id, provider, sandbox, status, amount_zat, fiat_currency, fiat_amount, rate, fee_fiat, network_fee_zat, deposit_address, deposit_uri, bank_label, provider_ref, created_at, updated_at, expires_at, events}`; starts at `awaiting_kyc`.
+- `POST /v1/account/withdrawals` `{amount_zat, currency}` -> 201 withdrawal `{id, provider, sandbox, status, amount_zat, fiat_currency, fiat_amount, rate, fee_fiat, network_fee_zat, deposit_address, deposit_uri, bank_label, provider_ref, created_at, updated_at, expires_at, events}`; starts at `awaiting_kyc`. 429 after 10 per merchant per hour.
 - `GET /v1/account/withdrawals?limit=50` (max 200, newest first) and `GET /v1/account/withdrawals/{id}`; `events` is `[{status, note, created_at}]`.
 - `POST /v1/account/withdrawals/{id}/kyc` `{bank_name, account_last4}` (mock only; with TransFi the provider widget does this step and the route is 404). `account_last4` must be exactly 4 digits. Stores the label only and moves to `awaiting_deposit` with a 30 min window.
 - `POST /v1/account/withdrawals/{id}/simulate-deposit` (mock only, 404 otherwise): `awaiting_deposit` -> `deposit_received`, then `converting`, `payout_processing`, `completed` at 5 s steps.
@@ -206,7 +214,7 @@ All features are on every plan; only volume is limited. Existing merchants are o
 
 ### Export (session auth)
 
-`GET /v1/account/export.csv?from=<unix>&to=<unix>&kind=invoices|payments`. `kind` defaults to `invoices`; the range filters on invoice `created_at` (default all); max 50000 rows. Returns a `text/csv` attachment `lunaz-<kind>-<from>-<to>.csv` with a header row and RFC 4180 quoting. ZEC amounts are exact 8-decimal strings.
+`GET /v1/account/export.csv?from=<unix>&to=<unix>&kind=invoices|payments`. `kind` defaults to `invoices`; the range filters on invoice `created_at` (default all); max 50000 rows. Returns a `text/csv` attachment `lunaz-<kind>-<from>-<to>.csv` with a header row and RFC 4180 quoting. ZEC amounts are exact 8-decimal strings. Text cells starting with `=`, `+`, `-`, `@`, tab or CR (and not a number) get a leading `'` and are quoted, so spreadsheets do not run them as formulas. 429 after 5 exports per merchant per minute. The export runs on a separate read-only connection and does not block other requests.
 
 - `invoices`: `invoice_id, created_at, paid_at, status, amount_zec, received_zec (mined), overpaid_zec, usd_rate, received_usd, txid, paid_with, origin_chain, origin_amount, swap_status`. Dates are ISO 8601 UTC. `usd_rate` (USD per ZEC) is recorded from the 1Click price when the invoice turns paid or underpaid; older invoices have none. `paid_with` is `ZEC` or the swap symbol once the swap succeeded.
 - `payments`: `txid, action_index, pool (orchard|ironwood), invoice_id, value_zec, block_height (empty while mempool only), invoice_status`.
@@ -218,6 +226,6 @@ All features are on every plan; only volume is limited. Existing merchants are o
 ## Known limitations
 
 - Chain reorgs are not handled.
-- Exchange limits and swap request limits are in memory: lost on restart, not shared between instances. Run a single instance.
+- Rate limits (exchange, swaps, invoices per key, export, withdrawals, checkout, webhook tests) are in memory: lost on restart, not shared between instances. Run a single instance.
 - Swaps need an invoice of about 0.001 ZEC (100000 zat) or more.
 - The viewing key cannot be changed once set. Databases from older versions are migrated on startup: stored UFVKs are converted to UIVKs in place (invoice addresses stay valid). `orchard_ivk_hash` is backfilled for existing merchants (the count is logged). If two existing accounts already share a wallet, startup continues: a WARN names both merchant ids and the later one keeps a NULL hash until resolved by hand.
