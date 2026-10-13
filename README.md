@@ -31,6 +31,7 @@ Non-custodial shielded Zcash payment gateway. Merchants sign up, register a Unif
 | `LUNAZ_MOCK_FX` | `{"IDR":16400,"USD":1}` | mock only: USD -> fiat rates (indicative), also defines the supported currencies |
 | `LUNAZ_MOCK_ZEC_USD` | unset | mock only: fixed ZEC/USD price instead of the 1Click price |
 | `LUNAZ_PLANS` | built-in table below | JSON array `[{id,name,price_usd,invoices_per_month,api_keys}]` replacing the plans (`null` = unlimited / not purchasable); must include `free` |
+| `LUNAZ_INTERNAL_TOKEN` | unset | secret (>=32 chars) for `/v1/auth/exchange`; unset = endpoint returns 503; shorter aborts startup |
 | `LUNAZ_BILLING_MERCHANT_ID` | unset | id of the treasury merchant that receives subscription payments; unset = purchase endpoints return 503 `billing not configured` |
 | `LUNAZ_BILLING_SANDBOX` | unset | `1` enables `simulate-paid` (demos/tests) |
 | `RUST_LOG` | tracing default | log filter |
@@ -79,7 +80,7 @@ Compose:
     volumes:
       lunaz-data:
 
-Put it behind a TLS reverse proxy (Caddy or nginx). Proxy `/v1/invoices/{id}/ws` as a WebSocket (nginx needs the `Upgrade` and `Connection` headers). The login/signup IP rate limit sees the proxy's address, not the client's.
+Put it behind a TLS reverse proxy (Caddy or nginx). Proxy `/v1/invoices/{id}/ws` as a WebSocket (nginx needs the `Upgrade` and `Connection` headers). Block `/v1/auth/exchange` from the public internet.
 
 ## API
 
@@ -87,14 +88,18 @@ JSON; errors are `{"error": ...}`. Session token: `Authorization: Bearer <token>
 
 ### Auth
 
-- `POST /v1/auth/signup` `{email, name, password>=8}` -> 201 `{token}`; 409 if the email is taken
-- `POST /v1/auth/login` `{email, password}` -> `{token}`; 401 otherwise
+Sign-in is delegated to an identity provider (Magic, magic.link; email only). The browser logs in with an email OTP and gets a DID token; the landing server verifies it with `@magic-sdk/admin` and calls the exchange endpoint. core-service never sees provider tokens.
+
+- `POST /v1/auth/exchange` `{email}` with `Authorization: Bearer <LUNAZ_INTERNAL_TOKEN>` -> `{token, new_account, merchant_id}`. The email is trimmed and lowercased; the merchant is found or created (free plan, empty name). 401 on a wrong internal token, 503 `internal auth not configured` if the env is unset, 429 after 20 per email per 15 min.
+- `POST /v1/auth/signup` and `POST /v1/auth/login` -> 410 (password sign-in was removed). Existing accounts sign in by email.
 - `POST /v1/auth/logout` -> 204
-- Limits: 10 attempts per email and 30 per client IP per 15 min (429 `too many attempts, try again later`).
+
+**Security:** the exchange endpoint mints a session for any email, so it must only be reachable from the landing server: keep core-service internal or block `/v1/auth/exchange` at the proxy. `LUNAZ_INTERNAL_TOKEN` is a secret (min 32 chars).
 
 ### Account (session auth)
 
-- `GET /v1/account` -> `{id, email, name, network, ufvk_set, webhook_url, plan}`
+- `GET /v1/account` -> `{id, email, name, network, ufvk_set, webhook_url, plan}` (`name` may be empty)
+- `PUT /v1/account` `{name}` (1-80 chars) -> 204
 - `PUT /v1/account/ufvk` `{ufvk}` -> 204; set once, 409 if already set
 - `GET /v1/account/api-keys`; `POST` `{name}` -> 201 `{id, name, prefix, key}` (key shown once); `DELETE /v1/account/api-keys/{id}` -> 204 (revoke)
 - `GET /v1/account/invoices?limit=50` (max 200) -> `[{id, status, amount_zat, received_zat, overpaid_zat, address, txid, created_at, expires_at, paid_at}]`
@@ -185,8 +190,6 @@ All features are on every plan; only volume is limited. Existing merchants are o
 ## Known limitations
 
 - Chain reorgs are not handled.
-- Webhook retries, login/signup limits and swap request limits are in memory: lost on restart, not shared between instances. Run a single instance.
-- Behind a proxy, the IP rate limit sees the proxy's address.
-- No password reset.
+- Webhook retries, exchange limits and swap request limits are in memory: lost on restart, not shared between instances. Run a single instance.
 - Swaps need an invoice of about 0.001 ZEC (100000 zat) or more.
 - The UFVK cannot be changed once set.
