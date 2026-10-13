@@ -1,10 +1,10 @@
 # Lunaz core-service
 
-Non-custodial shielded Zcash payment gateway. Merchants sign up, register a Unified Full Viewing Key (UFVK) once, and create API keys. Each invoice gets its own shielded address, and the service detects payments by trial decryption. It holds viewing keys only and cannot spend funds.
+Non-custodial shielded Zcash payment gateway. Merchants sign up, register a Unified Incoming Viewing Key (UIVK) once, and create API keys. Each invoice gets its own shielded address, and the service detects payments by trial decryption. It holds incoming viewing keys only and cannot spend funds. A UFVK is also accepted, but it is reduced to its incoming key on save, so the server never stores the outgoing viewing key.
 
 ## Architecture
 
-- **Invoice addresses.** Each invoice address is derived from the merchant's UFVK at a fresh diversifier index, starting at an offset of 2^80 so it never collides with addresses the merchant uses elsewhere.
+- **Invoice addresses.** Each invoice address is derived from the merchant's UIVK at a fresh diversifier index, starting at an offset of 2^80 so it never collides with addresses the merchant uses elsewhere.
 - **Watcher.** A scanner reads compact blocks from lightwalletd (gRPC over TLS) and trial-decrypts Orchard and Ironwood actions with every merchant's viewing key. A second task does the same for the mempool, so payments show as `detected` before they are mined.
 - **Cross-chain.** A buyer can pay in another asset through NEAR Intents 1Click. The buyer sends funds on their own chain and 1Click delivers ZEC to the invoice address. The watcher sees the ZEC as usual. Swap status is polled every 10 s.
 - **Webhooks.** Signed POSTs on invoice and swap events, retried in-process, every attempt logged.
@@ -12,10 +12,10 @@ Non-custodial shielded Zcash payment gateway. Merchants sign up, register a Unif
 
 ## Privacy and security model
 
-- The server holds viewing keys, so it can see incoming payments to its merchants' invoice addresses (amounts, txids). It cannot spend, and it cannot see outgoing payments or balances elsewhere.
+- Lunaz needs only an incoming viewing key. The server can see incoming payments to invoice addresses (amounts, txids); it cannot see outgoing payments, spends or the wallet balance.
 - Nothing on chain links invoices to each other or to the merchant. Only the logged-in merchant sees the ledger and CSV export.
 - Cross-chain payments: the origin-chain leg is public. Only the final shielded leg is private.
-- Passwords are hashed with Argon2id. Session tokens and API keys are stored as hashes. API keys (`lz_...`) can create invoices only. The UFVK can be set once.
+- Passwords are hashed with Argon2id. Session tokens and API keys are stored as hashes. API keys (`lz_...`) can create invoices only. The viewing key can be set once.
 - The invoice id is the capability for the public endpoints (`GET /v1/invoices/{id}`, WebSocket, swap).
 
 ## Configuration
@@ -106,15 +106,15 @@ Sign-in is delegated to an identity provider (Magic, magic.link; email only). Th
 
 ### Account (session auth)
 
-- `GET /v1/account` -> `{id, email, name, network, ufvk_set, webhook_url, plan}` (`name` may be empty)
+- `GET /v1/account` -> `{id, email, name, network, viewing_key_set, ufvk_set, webhook_url, plan}` (`name` may be empty)
 - `PUT /v1/account` `{name}` (1-80 chars) -> 204
-- `PUT /v1/account/ufvk` `{ufvk}` -> 204; set once, 409 if already set
+- `PUT /v1/account/viewing-key` `{viewing_key}` -> 204; set once, 409 if already set or used by another account. Accepts a UIVK (`uivk...`) or a UFVK (`uview...`); a UFVK is reduced to its UIVK and only the UIVK is stored. `PUT /v1/account/ufvk` is the legacy alias and also accepts `{ufvk}`.
 - `GET /v1/account/api-keys`; `POST` `{name}` -> 201 `{id, name, prefix, key}` (key shown once); `DELETE /v1/account/api-keys/{id}` -> 204 (revoke)
 - `GET /v1/account/invoices?limit=50` (max 200) -> `[{id, status, amount_zat, received_zat, overpaid_zat, address, txid, created_at, expires_at, paid_at}]`
 
 ### Invoices
 
-- `POST /v1/invoices` (API key; 400 until a UFVK is set) `{amount_zat, expires_in_secs?=900}`. `expires_in_secs` is clamped to 60..86400, `amount_zat` must be 1..21e14. -> `{id, address, amount_zat, zip321_uri, status, expires_at}`
+- `POST /v1/invoices` (API key; 400 until a viewing key is set) `{amount_zat, expires_in_secs?=900}`. `expires_in_secs` is clamped to 60..86400, `amount_zat` must be 1..21e14. -> `{id, address, amount_zat, zip321_uri, status, expires_at}`
 - `GET /v1/invoices/{id}` (public) -> `{status, amount_zat, received_zat, overpaid_zat, txid, expires_at, swap}`; `swap` is null or `{status, symbol, blockchain, deposit_address, amount_in_formatted, deadline}`
 - `GET /v1/invoices/{id}/ws` WebSocket: `{"status":...}` now and on each change, plus `"swap_status"` (1Click status) when a swap exists. Closes on paid, underpaid or expired.
 
@@ -174,7 +174,7 @@ All features are on every plan; only volume is limited. Existing merchants are o
 
 - Limits: `POST /v1/invoices` counts invoices created in the current UTC calendar month (billing invoices excluded); `POST /v1/account/api-keys` counts active keys. Over the limit -> 402 `{error, limit, used, plan}`.
 - A plan is effective until `plan_expires_at`; after that the merchant is on `free`. The 10 s sweep resets the stored plan and sends the `plan.updated` webhook `{type, invoice_id: null, plan, expires_at}`.
-- ZEC billing is dogfooded: the treasury (`LUNAZ_BILLING_MERCHANT_ID`) is an ordinary Lunaz merchant with a UFVK. A checkout creates a normal invoice on it (memo `lunaz:billing:<subscription id>`, 30 min), priced `ceil(price_usd * months / zec_usd * 1e8)` zat with the cached 1Click ZEC price (`LUNAZ_MOCK_ZEC_USD` as fallback; 503 without a price). The invoice is public like any other (`GET /v1/invoices/{id}`, WebSocket).
+- ZEC billing is dogfooded: the treasury (`LUNAZ_BILLING_MERCHANT_ID`) is an ordinary Lunaz merchant with a viewing key. A checkout creates a normal invoice on it (memo `lunaz:billing:<subscription id>`, 30 min), priced `ceil(price_usd * months / zec_usd * 1e8)` zat with the cached 1Click ZEC price (`LUNAZ_MOCK_ZEC_USD` as fallback; 503 without a price). The invoice is public like any other (`GET /v1/invoices/{id}`, WebSocket).
 - When that invoice turns `paid` the subscription is paid, the plan runs for `months * 30` days from `max(now, current expiry)` if it is the same still-active plan, otherwise from now. Underpaid or expired -> subscription `expired` (a late top-up to the full amount still activates it).
 - No proration: switching to another paid plan starts the new plan now and replaces the old one. Renewals are manual payments; nothing is charged automatically.
 - `GET /v1/plans` (public) -> `[{id, name, price_usd, invoices_per_month, api_keys}]`
@@ -200,4 +200,4 @@ All features are on every plan; only volume is limited. Existing merchants are o
 - Chain reorgs are not handled.
 - Webhook retries, exchange limits and swap request limits are in memory: lost on restart, not shared between instances. Run a single instance.
 - Swaps need an invoice of about 0.001 ZEC (100000 zat) or more.
-- The UFVK cannot be changed once set.
+- The viewing key cannot be changed once set. Databases from older versions are migrated on startup: stored UFVKs are converted to UIVKs in place (invoice addresses stay valid).
