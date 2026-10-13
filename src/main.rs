@@ -60,6 +60,15 @@ pub fn app(st: Arc<St>) -> Router {
         )
         .route("/v1/account/webhook/rotate", post(account::rotate_webhook))
         .route("/v1/account/webhook/test", post(account::test_webhook))
+        .route("/v1/account/webhook/events", get(account::list_events))
+        .route(
+            "/v1/account/webhook/events/retry-failed",
+            post(account::retry_failed),
+        )
+        .route(
+            "/v1/account/webhook/events/{id}/retry",
+            post(account::retry_event),
+        )
         .route(
             "/v1/account/webhook/deliveries",
             get(account::list_deliveries),
@@ -114,6 +123,10 @@ CREATE INDEX IF NOT EXISTS swaps_invoice ON swaps(invoice_id);
 CREATE TABLE IF NOT EXISTS webhook_deliveries(id INTEGER PRIMARY KEY, merchant_id INTEGER NOT NULL, invoice_id TEXT, type TEXT NOT NULL, url TEXT NOT NULL,
   status_code INTEGER, error TEXT, attempt INTEGER NOT NULL, created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS webhook_deliveries_merchant ON webhook_deliveries(merchant_id, id);
+CREATE TABLE IF NOT EXISTS webhook_events(id TEXT PRIMARY KEY, merchant_id INTEGER NOT NULL, invoice_id TEXT, type TEXT NOT NULL, body TEXT NOT NULL,
+  status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER, last_status_code INTEGER, last_error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS webhook_events_merchant ON webhook_events(merchant_id, created_at);
+CREATE INDEX IF NOT EXISTS webhook_events_due ON webhook_events(status, next_attempt_at);
 CREATE TABLE IF NOT EXISTS withdrawals(id TEXT PRIMARY KEY, merchant_id INTEGER NOT NULL, provider TEXT NOT NULL, status TEXT NOT NULL, amount_zat INTEGER NOT NULL,
   fiat_currency TEXT NOT NULL, fiat_amount TEXT NOT NULL, rate_zec_fiat TEXT NOT NULL, fee_fiat TEXT NOT NULL, network_fee_zat INTEGER NOT NULL,
   deposit_address TEXT NOT NULL, deposit_uri TEXT NOT NULL, bank_label TEXT, provider_ref TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
@@ -131,6 +144,7 @@ fn migrate(db: &Connection, net: &Network) -> rusqlite::Result<()> {
         ("invoices", "paid_usd_rate", "REAL"),
         ("merchants", "plan", "TEXT NOT NULL DEFAULT 'free'"),
         ("merchants", "plan_expires_at", "INTEGER"),
+        ("webhook_deliveries", "event_id", "TEXT"),
     ] {
         let has: bool = db.query_row(
             "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name=?2",
@@ -216,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(watcher::scanner(st.clone()));
     tokio::spawn(watcher::mempool(st.clone()));
     tokio::spawn(swap::poller(st.clone()));
+    tokio::spawn(hook::run(st.clone()));
 
     let app = app(st);
     let bind = env("LUNAZ_BIND").unwrap_or("0.0.0.0:8080".into());

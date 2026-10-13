@@ -362,20 +362,14 @@ pub fn sweep(st: &Arc<St>) {
 }
 
 fn plan_updated(st: &Arc<St>, db: &Connection, mid: i64) -> anyhow::Result<()> {
-    let (plan, exp, url, secret): (String, Option<i64>, Option<String>, String) = db.query_row(
-        "SELECT plan, plan_expires_at, webhook_url, webhook_secret FROM merchants WHERE id=?1",
+    let (plan, exp): (String, Option<i64>) = db.query_row(
+        "SELECT plan, plan_expires_at FROM merchants WHERE id=?1",
         [mid],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    let Some(url) = url else { return Ok(()) };
     let body = json!({"type": "plan.updated", "invoice_id": null, "plan": plan, "expires_at": exp})
         .to_string();
-    let st = st.clone();
-    tokio::spawn(async move {
-        let _ =
-            crate::hook::deliver(&st, mid, None, "plan.updated", (&url, &secret), body, true).await;
-    });
-    Ok(())
+    crate::hook::enqueue(st, db, mid, None, "plan.updated", body)
 }
 
 #[cfg(test)]

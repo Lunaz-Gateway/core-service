@@ -300,19 +300,17 @@ pub async fn send_webhook(
 
 pub async fn test_webhook(State(st): S, h: HeaderMap) -> Result<(StatusCode, Json<Value>), AppErr> {
     let mid = auth(&st, &h)?;
-    let (url, secret): (Option<String>, String) = st.db.lock().unwrap().query_row(
-        "SELECT webhook_url, webhook_secret FROM merchants WHERE id=?1",
+    let url: Option<String> = st.db.lock().unwrap().query_row(
+        "SELECT webhook_url FROM merchants WHERE id=?1",
         [mid],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| r.get(0),
     )?;
-    let url = url.ok_or_else(|| bad(StatusCode::BAD_REQUEST, "webhook url not set"))?;
+    url.ok_or_else(|| bad(StatusCode::BAD_REQUEST, "webhook url not set"))?;
     let body = json!({"type": "test", "invoice_id": null, "status": "paid", "amount_zat": 0, "received_zat": 0, "overpaid_zat": 0, "txid": null, "swap": null}).to_string();
-    Ok(
-        match crate::hook::deliver(&st, mid, None, "test", (&url, &secret), body, false).await {
-            Ok(s) => (StatusCode::OK, Json(json!({"status": s}))),
-            Err(e) => (StatusCode::OK, Json(json!({"error": e.to_string()}))),
-        },
-    )
+    Ok(match crate::hook::send_test(&st, mid, body).await {
+        Ok(s) => (StatusCode::OK, Json(json!({"status": s}))),
+        Err(e) => (StatusCode::OK, Json(json!({"error": e.to_string()}))),
+    })
 }
 
 #[derive(Deserialize)]
@@ -341,15 +339,89 @@ pub async fn list_deliveries(State(st): S, h: HeaderMap, Query(q): Query<Lim>) -
     let mid = auth(&st, &h)?;
     let db = st.db.lock().unwrap();
     let mut s = db.prepare(
-        "SELECT id, invoice_id, type, url, status_code, error, attempt, created_at FROM webhook_deliveries WHERE merchant_id=?1 ORDER BY id DESC LIMIT ?2",
+        "SELECT id, invoice_id, type, url, status_code, error, attempt, created_at, event_id FROM webhook_deliveries WHERE merchant_id=?1 ORDER BY id DESC LIMIT ?2",
     )?;
     let v = s
         .query_map(params![mid, q.limit.unwrap_or(50).clamp(1, 200)], |r| {
             Ok(json!({"id": r.get::<_, i64>(0)?, "invoice_id": r.get::<_, Option<String>>(1)?, "type": r.get::<_, String>(2)?, "url": r.get::<_, String>(3)?,
-                "status_code": r.get::<_, Option<i64>>(4)?, "error": r.get::<_, Option<String>>(5)?, "attempt": r.get::<_, i64>(6)?, "created_at": r.get::<_, i64>(7)?}))
+                "status_code": r.get::<_, Option<i64>>(4)?, "error": r.get::<_, Option<String>>(5)?, "attempt": r.get::<_, i64>(6)?, "created_at": r.get::<_, i64>(7)?, "event_id": r.get::<_, Option<String>>(8)?}))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Json(v.into()))
+}
+
+#[derive(Deserialize)]
+pub struct EventsQ {
+    status: Option<String>,
+    limit: Option<i64>,
+}
+
+fn event_json(db: &rusqlite::Connection, mid: i64, id: &str) -> rusqlite::Result<Option<Value>> {
+    let ev = db
+        .query_row(
+            "SELECT id, type, invoice_id, status, attempts, next_attempt_at, last_status_code, last_error, created_at, updated_at
+             FROM webhook_events WHERE id=?1 AND merchant_id=?2",
+            params![id, mid],
+            |r| {
+                Ok(json!({"id": r.get::<_, String>(0)?, "type": r.get::<_, String>(1)?, "invoice_id": r.get::<_, Option<String>>(2)?,
+                    "status": r.get::<_, String>(3)?, "attempts": r.get::<_, i64>(4)?, "max_attempts": crate::hook::MAX_ATTEMPTS,
+                    "next_attempt_at": r.get::<_, Option<i64>>(5)?, "last_status_code": r.get::<_, Option<i64>>(6)?,
+                    "last_error": r.get::<_, Option<String>>(7)?, "created_at": r.get::<_, i64>(8)?, "updated_at": r.get::<_, i64>(9)?}))
+            },
+        )
+        .optional()?;
+    let Some(mut ev) = ev else { return Ok(None) };
+    ev["deliveries"] = db
+        .prepare("SELECT attempt, status_code, error, created_at FROM webhook_deliveries WHERE event_id=?1 ORDER BY id")?
+        .query_map([id], |r| {
+            Ok(json!({"attempt": r.get::<_, i64>(0)?, "status_code": r.get::<_, Option<i64>>(1)?, "error": r.get::<_, Option<String>>(2)?, "created_at": r.get::<_, i64>(3)?}))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into();
+    Ok(Some(ev))
+}
+
+pub async fn list_events(State(st): S, h: HeaderMap, Query(q): Query<EventsQ>) -> R {
+    let mid = auth(&st, &h)?;
+    if q.status
+        .as_deref()
+        .is_some_and(|s| !["pending", "delivered", "failed"].contains(&s))
+    {
+        return Err(bad(
+            StatusCode::BAD_REQUEST,
+            "status must be pending, delivered or failed",
+        ));
+    }
+    let db = st.db.lock().unwrap();
+    let ids: Vec<String> = db
+        .prepare("SELECT id FROM webhook_events WHERE merchant_id=?1 AND (?2 IS NULL OR status=?2) ORDER BY created_at DESC, rowid DESC LIMIT ?3")?
+        .query_map(params![mid, q.status, q.limit.unwrap_or(50).clamp(1, 200)], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let v = ids
+        .iter()
+        .filter_map(|i| event_json(&db, mid, i).transpose())
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Json(v.into()))
+}
+
+pub async fn retry_event(State(st): S, h: HeaderMap, Path(id): Path<String>) -> R {
+    let mid = auth(&st, &h)?;
+    let db = st.db.lock().unwrap();
+    if !crate::hook::retry(&db, mid, &id)? {
+        let found = event_json(&db, mid, &id)?.is_some();
+        return Err(if found {
+            bad(StatusCode::CONFLICT, "only failed events can be retried")
+        } else {
+            bad(StatusCode::NOT_FOUND, "no such event")
+        });
+    }
+    Ok(Json(event_json(&db, mid, &id)?.unwrap_or_default()))
+}
+
+pub async fn retry_failed(State(st): S, h: HeaderMap) -> R {
+    let mid = auth(&st, &h)?;
+    let n = crate::hook::retry_failed(&st.db.lock().unwrap(), mid)?;
+    Ok(Json(json!({"retried": n})))
 }
 
 #[cfg(test)]

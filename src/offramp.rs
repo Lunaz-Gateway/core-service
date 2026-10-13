@@ -182,12 +182,11 @@ pub fn apply(
 ) -> anyhow::Result<bool> {
     let db = st.db.lock().unwrap();
     #[allow(clippy::type_complexity)]
-    let Some((cur, mid, url, secret, amount, cc, fiat)): Option<(String, i64, Option<String>, String, i64, String, String)> = db
+    let Some((cur, mid, amount, cc, fiat)): Option<(String, i64, i64, String, String)> = db
         .query_row(
-            "SELECT w.status, w.merchant_id, m.webhook_url, m.webhook_secret, w.amount_zat, w.fiat_currency, w.fiat_amount
-             FROM withdrawals w JOIN merchants m ON m.id=w.merchant_id WHERE w.id=?1",
+            "SELECT status, merchant_id, amount_zat, fiat_currency, fiat_amount FROM withdrawals WHERE id=?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?
     else {
@@ -206,24 +205,11 @@ pub fn apply(
         "INSERT INTO withdrawal_events(withdrawal_id,status,note,created_at) VALUES(?1,?2,?3,?4)",
         params![id, to, note, t],
     )?;
-    if let Some(url) = url {
-        let body = json!({"type": "withdrawal.updated", "invoice_id": null, "withdrawal_id": id, "status": to,
-            "amount_zat": amount, "fiat_currency": cc, "fiat_amount": fiat})
+    let body =
+        json!({"type": "withdrawal.updated", "invoice_id": null, "withdrawal_id": id, "status": to,
+        "amount_zat": amount, "fiat_currency": cc, "fiat_amount": fiat})
         .to_string();
-        let st = st.clone();
-        tokio::spawn(async move {
-            let _ = crate::hook::deliver(
-                &st,
-                mid,
-                None,
-                "withdrawal.updated",
-                (&url, &secret),
-                body,
-                true,
-            )
-            .await;
-        });
-    }
+    crate::hook::enqueue(st, &db, mid, None, "withdrawal.updated", body)?;
     Ok(true)
 }
 

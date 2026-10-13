@@ -71,6 +71,7 @@ fn expire(st: &Arc<St>) {
     sweep(st);
     crate::offramp::expire(st);
     crate::billing::sweep(st);
+    crate::hook::purge(&st.db.lock().unwrap());
     let _ = st
         .db
         .lock()
@@ -411,8 +412,9 @@ mod tests {
         (url, got)
     }
 
-    async fn wait(got: &std::sync::Mutex<Vec<serde_json::Value>>, n: usize) {
+    async fn wait(st: &Arc<St>, got: &std::sync::Mutex<Vec<serde_json::Value>>, n: usize) {
         for _ in 0..50 {
+            crate::hook::tick(st.clone()).await;
             if got.lock().unwrap().len() >= n {
                 return;
             }
@@ -433,7 +435,7 @@ mod tests {
         assert_eq!(status(&st), "detected"); // 40k < 100k, still open for a top-up
         record(&st, 1, D, "t2", 0, 67_000, Some(6)).unwrap(); // second payment adds up
         assert_eq!(status(&st), "paid");
-        wait(&got, 1).await;
+        wait(&st, &got, 1).await;
         let g = got.lock().unwrap();
         assert_eq!(g.len(), 1);
         assert_eq!(g[0]["type"], "invoice.paid");
@@ -459,7 +461,7 @@ mod tests {
             .unwrap();
         sweep(&st);
         assert_eq!(status(&st), "underpaid");
-        wait(&got, 1).await;
+        wait(&st, &got, 1).await;
         {
             let g = got.lock().unwrap();
             assert_eq!(g[0]["type"], "invoice.underpaid");
