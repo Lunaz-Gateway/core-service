@@ -146,6 +146,9 @@ fn migrate(db: &Connection) -> rusqlite::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    if std::env::args().nth(1).as_deref() != Some("healthcheck") {
+        tracing::info!("starting lunaz-core {}", env!("CARGO_PKG_VERSION"));
+    }
     let env = |k: &str| std::env::var(k).ok();
     // Hidden subcommand for container HEALTHCHECK (distroless has no curl).
     if std::env::args().nth(1).as_deref() == Some("healthcheck") {
