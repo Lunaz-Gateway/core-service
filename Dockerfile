@@ -11,7 +11,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    touch src/main.rs && cargo build --release --locked \
+    rm -rf target/release/lunaz-core target/release/deps/lunaz_core-* target/release/.fingerprint/lunaz-core-* \
+    && cargo build --release --locked \
     && cp target/release/lunaz-core /lunaz-core && ldd /lunaz-core \
     && mkdir /data
 
