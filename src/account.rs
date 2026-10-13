@@ -151,6 +151,9 @@ pub struct SetUfvk {
 
 pub async fn set_ufvk(State(st): S, h: HeaderMap, Json(b): Json<SetUfvk>) -> NoBody {
     let mid = auth(&st, &h)?;
+    if b.viewing_key.len() > 2048 {
+        return Err(bad(StatusCode::BAD_REQUEST, "viewing key is too long"));
+    }
     // Only the incoming key is stored (a UFVK is reduced to its UIVK).
     let u = parse_viewing_key(&st.net, &b.viewing_key)
         .map_err(|e| bad(StatusCode::BAD_REQUEST, &e.to_string()))?;
@@ -200,8 +203,9 @@ pub async fn create_key(
     Json(b): Json<NewKey>,
 ) -> Result<(StatusCode, Json<Value>), AppErr> {
     let mid = auth(&st, &h)?;
-    if b.name.trim().is_empty() {
-        return Err(bad(StatusCode::BAD_REQUEST, "name required"));
+    let n = b.name.trim().chars().count();
+    if n == 0 || n > 80 {
+        return Err(bad(StatusCode::BAD_REQUEST, "name must be 1-80 characters"));
     }
     let key = format!("lz_{}", rand_hex());
     let prefix = &key[..12];

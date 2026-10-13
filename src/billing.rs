@@ -194,7 +194,7 @@ pub async fn list(State(st): S, h: HeaderMap) -> R {
     let db = st.db.lk();
     let mut q = db.prepare(
         "SELECT s.id, s.plan, s.months, s.price_usd, s.amount_zat, s.zec_usd, s.invoice_id, s.status, i.status, s.created_at, s.paid_at, s.period_start, s.period_end
-         FROM subscriptions s LEFT JOIN invoices i ON i.id=s.invoice_id WHERE s.merchant_id=?1 ORDER BY s.created_at DESC, s.rowid DESC",
+         FROM subscriptions s LEFT JOIN invoices i ON i.id=s.invoice_id WHERE s.merchant_id=?1 ORDER BY s.created_at DESC, s.rowid DESC LIMIT 200",
     )?;
     let v = q
         .query_map([mid], |r| {

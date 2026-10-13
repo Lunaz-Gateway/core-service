@@ -216,8 +216,11 @@ pub async fn create_swap(
         ));
     }
     let refund = b.refund_to.trim();
-    if refund.is_empty() {
-        return Err(bad(StatusCode::BAD_REQUEST, "refund_to required"));
+    if refund.is_empty() || refund.len() > 128 {
+        return Err(bad(
+            StatusCode::BAD_REQUEST,
+            "refund_to must be 1-128 characters",
+        ));
     }
     let list = assets(&st).await.map_err(|e| {
         tracing::warn!("tokens: {e:#}");

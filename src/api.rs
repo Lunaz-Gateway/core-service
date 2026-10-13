@@ -152,6 +152,12 @@ pub async fn create_invoice(
         .query_row("UPDATE api_keys SET last_used_at=?1 WHERE key_hash=?2 AND revoked_at IS NULL RETURNING merchant_id", params![now(), kh], |r| r.get(0))
         .optional()?
         .ok_or_else(|| bad(StatusCode::UNAUTHORIZED, "bad api key"))?;
+    if !st.limits.hit(&format!("inv:{kh}"), 60, 60, now()) {
+        return Err(bad(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many invoices for this api key, try again in a minute",
+        ));
+    }
     crate::billing::check_invoices(&st, &db, mid)?;
     Ok(Json(new_invoice(&st, &db, mid, b.amount_zat, ttl, None)?))
 }
