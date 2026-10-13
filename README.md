@@ -102,7 +102,7 @@ Common errors:
 
 ## API
 
-JSON; errors are `{"error": ...}`. Session token: `Authorization: Bearer <token>`, valid 30 days. The merchant API uses an API key as the Bearer token.
+JSON; errors are `{"error": ...}`. Session token: `Authorization: Bearer <token>`, valid 7 days. The merchant API uses an API key as the Bearer token.
 
 ### Limits and headers
 

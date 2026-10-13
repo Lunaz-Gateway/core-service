@@ -15,7 +15,7 @@ use zcash_protocol::consensus::Network;
 pub type S = State<Arc<St>>;
 type NoBody = Result<StatusCode, AppErr>;
 
-const SESSION_SECS: i64 = 30 * 86400;
+const SESSION_SECS: i64 = 7 * 86400;
 
 pub fn norm_email(e: &str) -> Option<String> {
     let e = e.trim().to_lowercase();
