@@ -19,8 +19,11 @@ fn zec(z: i64) -> String {
     format!("{}.{:08}", z / 100_000_000, z % 100_000_000)
 }
 
+/// RFC 4180 quoting; a text cell a spreadsheet would run as a formula gets a leading ' (numbers stay as they are).
 fn field(s: &str) -> String {
-    if s.contains([',', '"', '\n', '\r']) {
+    if s.starts_with(['=', '+', '-', '@', '\t', '\r']) && s.parse::<f64>().is_err() {
+        format!("\"'{}\"", s.replace('"', "\"\""))
+    } else if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
@@ -178,5 +181,15 @@ mod tests {
         assert_eq!(field("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(field("l1\nl2"), "\"l1\nl2\"");
         assert_eq!(line(&["a".into(), "b,c".into()]), "a,\"b,c\"\r\n");
+        // formula injection
+        assert_eq!(field("=HYPERLINK(\"x\")"), "\"'=HYPERLINK(\"\"x\"\")\"");
+        for s in ["+1+cmd", "-2+3", "@SUM(A1)", "\tx", "\rx"] {
+            assert_eq!(field(s), format!("\"'{s}\""));
+        }
+        assert_eq!(field("a=b"), "a=b");
+        // numeric cells are untouched
+        for s in ["-1", "0.00000000", "+5", "-0.5"] {
+            assert_eq!(field(s), s);
+        }
     }
 }
