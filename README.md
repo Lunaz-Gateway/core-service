@@ -37,6 +37,7 @@ The API reference is in the [documentation](https://lunaz.alwaysbedream.dev/docs
 | `LUNAZ_WEBHOOK_ALLOW_HTTP` | unset | `1` also accepts plain `http://` webhook URLs (still public hosts, default port) |
 | `LUNAZ_WEBHOOK_ALLOW_PRIVATE` | unset | development only: `1` allows webhooks to private/loopback addresses, any port, `http` |
 | `LUNAZ_MAX_WS` | `2000` | maximum concurrent invoice WebSockets |
+| `LUNAZ_SCAN_THREADS` | half the CPU cores (at least 1) | threads for trial decryption of blocks and mempool transactions, integer >= 1 (`1` = no extra threads); other values abort startup |
 | `RUST_LOG` | tracing default | log filter |
 
 Mainnet guards: with `LUNAZ_NETWORK=main` the service refuses to start when `LUNAZ_BILLING_SANDBOX` is on, when the off-ramp is `mock` (the default) without `LUNAZ_ALLOW_MOCK_ON_MAINNET=1`, or when `LUNAZ_WEBHOOK_ALLOW_PRIVATE` is on, unless `LUNAZ_DEV=1` is set. Boolean variables accept `1`, `true`, `yes` or `on`.

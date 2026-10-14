@@ -40,6 +40,10 @@ pub struct St {
     pub hook: hook::Cfg,
     pub ws: Arc<tokio::sync::Semaphore>,
     pub ws_per: Mutex<std::collections::HashMap<String, usize>>,
+    /// Parsed viewing keys by merchant id; a key is set once and never changes.
+    pub keys: Mutex<std::collections::HashMap<i64, Arc<watcher::Key>>>,
+    /// Threads for trial decryption (LUNAZ_SCAN_THREADS).
+    pub scan_threads: usize,
 }
 
 /// Lock that survives a panic in another holder (std Mutex poisoning).
@@ -183,6 +187,7 @@ CREATE TABLE IF NOT EXISTS payments(txid TEXT NOT NULL, action_idx INTEGER NOT N
 CREATE INDEX IF NOT EXISTS payments_invoice ON payments(invoice_id);
 CREATE INDEX IF NOT EXISTS invoices_merchant ON invoices(merchant_id, created_at);
 CREATE INDEX IF NOT EXISTS invoices_status ON invoices(status);
+CREATE INDEX IF NOT EXISTS invoices_expires ON invoices(expires_at);
 CREATE INDEX IF NOT EXISTS api_keys_merchant ON api_keys(merchant_id);
 CREATE TABLE IF NOT EXISTS sync_state(id INTEGER PRIMARY KEY CHECK(id=1), height INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS swaps(id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL, origin_asset TEXT NOT NULL, symbol TEXT NOT NULL, blockchain TEXT NOT NULL,
@@ -340,6 +345,14 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("LUNAZ_WEBHOOK_ALLOW_PRIVATE is on: webhooks may target private and loopback addresses (development only)");
     }
     let (off, fee) = (offramp::Cfg::from_env(env)?, fees::Cfg::from_env(env)?);
+    let scan_threads = match env("LUNAZ_SCAN_THREADS") {
+        None => std::thread::available_parallelism()
+            .map_or(1, |c| c.get() / 2)
+            .max(1),
+        Some(v) => v.parse().ok().filter(|&n: &usize| n >= 1).ok_or_else(|| {
+            anyhow::anyhow!("LUNAZ_SCAN_THREADS must be an integer >= 1, got {v}")
+        })?,
+    };
     let opts = dev_options(&env, off.provider == offramp::Provider::Mock);
     if truthy(env("LUNAZ_DEV")) {
         tracing::warn!(
@@ -387,6 +400,8 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or(2000),
         )),
         ws_per: Default::default(),
+        keys: Default::default(),
+        scan_threads,
     });
 
     tokio::spawn(watcher::scanner(st.clone()));
@@ -464,6 +479,8 @@ pub mod tests {
             hook: hook::Cfg::new(true, true).unwrap(),
             ws: Arc::new(tokio::sync::Semaphore::new(2000)),
             ws_per: Default::default(),
+            keys: Default::default(),
+            scan_threads: 1,
         })
     }
 
