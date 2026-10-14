@@ -1,7 +1,7 @@
 mod account;
 mod api;
-mod billing;
 mod export;
+mod fees;
 mod hook;
 mod limit;
 mod offramp;
@@ -35,7 +35,7 @@ pub struct St {
     pub limits: limit::Limiter,
     pub zec_price: Mutex<Option<f64>>,
     pub off: offramp::Cfg,
-    pub bill: billing::Cfg,
+    pub fee: fees::Cfg,
     pub internal: Option<String>,
     pub hook: hook::Cfg,
     pub ws: Arc<tokio::sync::Semaphore>,
@@ -102,13 +102,12 @@ pub fn app(st: Arc<St>) -> Router {
             "/v1/account/webhook/deliveries",
             get(account::list_deliveries),
         )
-        .route("/v1/plans", get(billing::plans))
-        .route("/v1/account/plan", get(billing::my_plan))
-        .route("/v1/account/billing", get(billing::list))
-        .route("/v1/account/billing/checkout", post(billing::checkout))
+        .route("/v1/pricing", get(fees::pricing))
+        .route("/v1/account/fees", get(fees::summary))
+        .route("/v1/account/fees/settle", post(fees::settle))
         .route(
-            "/v1/account/billing/{id}/simulate-paid",
-            post(billing::simulate_paid),
+            "/v1/account/fees/settle/{id}/simulate-paid",
+            post(fees::simulate_paid),
         )
         .route("/v1/account/invoices", get(account::list_invoices))
         .route("/v1/account/export.csv", get(export::export_csv))
@@ -153,7 +152,7 @@ async fn security_headers(req: Request, next: Next) -> Response {
     let cacheable = matches!(*req.method(), Method::GET | Method::HEAD)
         && matches!(
             req.uri().path(),
-            "/healthz" | "/v1/plans" | "/v1/swap/assets"
+            "/healthz" | "/v1/pricing" | "/v1/swap/assets"
         );
     let mut r = next.run(req).await;
     let h = r.headers_mut();
@@ -206,7 +205,14 @@ CREATE INDEX IF NOT EXISTS withdrawal_events_w ON withdrawal_events(withdrawal_i
 CREATE TABLE IF NOT EXISTS subscriptions(id TEXT PRIMARY KEY, merchant_id INTEGER NOT NULL, plan TEXT NOT NULL, months INTEGER NOT NULL, price_usd REAL NOT NULL,
   amount_zat INTEGER NOT NULL, zec_usd REAL NOT NULL, invoice_id TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, paid_at INTEGER, period_start INTEGER, period_end INTEGER);
 CREATE INDEX IF NOT EXISTS subscriptions_invoice ON subscriptions(invoice_id);
-CREATE INDEX IF NOT EXISTS subscriptions_merchant ON subscriptions(merchant_id, created_at);";
+CREATE INDEX IF NOT EXISTS subscriptions_merchant ON subscriptions(merchant_id, created_at);
+CREATE TABLE IF NOT EXISTS fee_payments(txid TEXT NOT NULL, action_idx INTEGER NOT NULL, invoice_id TEXT NOT NULL,
+  value_zat INTEGER NOT NULL, height INTEGER, seen_at INTEGER, PRIMARY KEY(txid, action_idx));
+CREATE INDEX IF NOT EXISTS fee_payments_invoice ON fee_payments(invoice_id);
+CREATE TABLE IF NOT EXISTS fee_settlements(id TEXT PRIMARY KEY, merchant_id INTEGER NOT NULL, invoice_id TEXT NOT NULL, amount_zat INTEGER NOT NULL,
+  status TEXT NOT NULL, created_at INTEGER NOT NULL, paid_at INTEGER);
+CREATE INDEX IF NOT EXISTS fee_settlements_invoice ON fee_settlements(invoice_id);
+CREATE INDEX IF NOT EXISTS fee_settlements_merchant ON fee_settlements(merchant_id, created_at);";
 
 /// Idempotent column additions for databases created by older versions.
 fn migrate(db: &Connection, net: &Network) -> rusqlite::Result<()> {
@@ -218,6 +224,10 @@ fn migrate(db: &Connection, net: &Network) -> rusqlite::Result<()> {
         ("payments", "seen_at", "INTEGER"),
         ("invoices", "extended_at", "INTEGER"),
         ("merchants", "orchard_ivk_hash", "TEXT"),
+        ("invoices", "fee_zat", "INTEGER NOT NULL DEFAULT 0"),
+        ("invoices", "fee_div_index", "INTEGER"),
+        ("invoices", "fee_address", "TEXT"),
+        ("swaps", "lunaz_fee_bps", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         let has: bool = db.query_row(
             "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name=?2",
@@ -251,6 +261,10 @@ fn migrate(db: &Connection, net: &Network) -> rusqlite::Result<()> {
     }
     db.execute(
         "CREATE INDEX IF NOT EXISTS webhook_deliveries_event ON webhook_deliveries(event_id)",
+        [],
+    )?;
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS invoices_fee_div ON invoices(fee_div_index)",
         [],
     )?;
     db.execute(
@@ -325,7 +339,7 @@ async fn main() -> anyhow::Result<()> {
     if allow_private {
         tracing::warn!("LUNAZ_WEBHOOK_ALLOW_PRIVATE is on: webhooks may target private and loopback addresses (development only)");
     }
-    let (off, bill) = (offramp::Cfg::from_env(env)?, billing::Cfg::from_env(env)?);
+    let (off, fee) = (offramp::Cfg::from_env(env)?, fees::Cfg::from_env(env)?);
     let opts = dev_options(&env, off.provider == offramp::Provider::Mock);
     if truthy(env("LUNAZ_DEV")) {
         tracing::warn!(
@@ -364,7 +378,7 @@ async fn main() -> anyhow::Result<()> {
         limits: Default::default(),
         zec_price: Mutex::new(None),
         off,
-        bill,
+        fee,
         internal,
         hook: hook::Cfg::new(allow_private, truthy(env("LUNAZ_WEBHOOK_ALLOW_HTTP")))?,
         ws: Arc::new(tokio::sync::Semaphore::new(
@@ -445,7 +459,7 @@ pub mod tests {
             limits: Default::default(),
             zec_price: Mutex::new(None),
             off: Default::default(),
-            bill: Default::default(),
+            fee: Default::default(),
             internal: Some("t".repeat(32)),
             hook: hook::Cfg::new(true, true).unwrap(),
             ws: Arc::new(tokio::sync::Semaphore::new(2000)),
@@ -653,6 +667,10 @@ pub mod tests {
             "SELECT id FROM invoices WHERE status='detected'",
             "SELECT id FROM webhook_deliveries WHERE event_id='x'",
             "SELECT COUNT(*) FROM api_keys WHERE merchant_id=1 AND revoked_at IS NULL",
+            "SELECT id FROM invoices WHERE fee_div_index=1",
+            "SELECT COALESCE(SUM(value_zat),0) FROM fee_payments WHERE invoice_id='x' AND height IS NOT NULL",
+            "SELECT id FROM fee_settlements WHERE invoice_id='x'",
+            "SELECT id FROM fee_settlements WHERE merchant_id=1 ORDER BY created_at DESC",
         ] {
             let plan: String = db
                 .query_row(&format!("EXPLAIN QUERY PLAN {q}"), [], |r| r.get(3))

@@ -7,7 +7,7 @@ Non-custodial shielded Zcash payment gateway. Merchants sign up, register a Unif
 - **Invoice addresses.** Each invoice address is derived from the merchant's UIVK at a fresh diversifier index, starting at an offset of 2^80 so it never collides with addresses the merchant uses elsewhere.
 - **Watcher.** A scanner reads compact blocks from lightwalletd (gRPC over TLS) and trial-decrypts Orchard and Ironwood actions with every merchant's viewing key. A second task does the same for the mempool, so payments show as `detected` before they are mined.
 - **Cross-chain.** A buyer can pay in another asset through NEAR Intents 1Click. The buyer sends funds on their own chain and 1Click delivers ZEC to the invoice address. The watcher sees the ZEC as usual. Swap status is polled every 10 s.
-- **Webhooks.** Signed POSTs on invoice, swap, withdrawal and plan events. Every event is stored, retried up to 3 times and keeps a final status; failed ones can be retried by hand.
+- **Webhooks.** Signed POSTs on invoice, swap and withdrawal events. Every event is stored, retried up to 3 times and keeps a final status; failed ones can be retried by hand.
 - **Storage.** One SQLite file (bundled rusqlite) in WAL mode with a 5 s busy timeout, so the CSV export reads on its own read-only connection while the service keeps writing. Tables and indexes (payments by invoice, invoices by merchant and created_at, invoices by status, API keys by merchant, webhook deliveries by event) are created on start; older databases are migrated in place.
 
 ## Privacy and security model
@@ -30,13 +30,14 @@ Non-custodial shielded Zcash payment gateway. Merchants sign up, register a Unif
 | `LUNAZ_BIND` | `127.0.0.1:8080` (Docker image: `0.0.0.0:8080`) | listen address |
 | `LUNAZ_ONECLICK_JWT` | unset | 1Click token; without it 1Click adds a 0.25% fee |
 | `LUNAZ_APP_FEE_RECIPIENT` | unset | NEAR account that receives the cross-chain app fee (1Click `appFees`); set together with `LUNAZ_APP_FEE_BPS` |
-| `LUNAZ_APP_FEE_BPS` | unset | app fee in basis points, 0-1000 (50 = 0.5%); the buyer pays it on top of the swap, the invoice still receives its full amount |
+| `LUNAZ_APP_FEE_BPS` | unset | app fee in basis points, 0-1000 (50 = 0.5%); the buyer pays it on top of the swap, the invoice still receives its full amount. When the Lunaz fee is active, `LUNAZ_FEE_BPS` is added to it and that invoice's in-payment fee is waived (production: 25, giving 0.75% in total) |
 | `LUNAZ_OFFRAMP` | `mock` | off-ramp provider: `mock` or `transfi` (not implemented yet: off-ramp requests return 501) |
 | `LUNAZ_MOCK_FX` | `{"IDR":16400,"USD":1}` | mock only: USD -> fiat rates (indicative), also defines the supported currencies |
-| `LUNAZ_MOCK_ZEC_USD` | unset | mock off-ramp only (ignored otherwise): fixed ZEC/USD price instead of the 1Click price, also the billing fallback price |
-| `LUNAZ_PLANS` | built-in table below | JSON array `[{id,name,price_usd,invoices_per_month,api_keys}]` replacing the plans (`null` = unlimited / not purchasable); must include `free` |
+| `LUNAZ_MOCK_ZEC_USD` | unset | mock off-ramp only (ignored otherwise): fixed ZEC/USD price instead of the 1Click price |
+| `LUNAZ_FEE_BPS` | `50` | Lunaz per-payment fee in basis points, 0-1000 (50 = 0.5%); other values abort startup. Active only with `LUNAZ_BILLING_MERCHANT_ID` set (see Fees) |
+| `LUNAZ_FEE_MIN_ZAT` | `1000` | minimum fee per invoice in zatoshi |
 | `LUNAZ_INTERNAL_TOKEN` | unset | secret (>=32 chars) for `/v1/auth/exchange`; unset = endpoint returns 503; shorter aborts startup |
-| `LUNAZ_BILLING_MERCHANT_ID` | unset | id of the treasury merchant that receives subscription payments; unset = purchase endpoints return 503 `billing not configured` |
+| `LUNAZ_BILLING_MERCHANT_ID` | unset | id of the treasury merchant that receives fees and fee settlements; the fee is charged only when it is set and that merchant has a viewing key. Unset = no fee, settle returns 503 |
 | `LUNAZ_BILLING_SANDBOX` | unset | `1` enables `simulate-paid` (demos/tests) |
 | `LUNAZ_DEV` | unset | `1` marks a local development instance: allows the dev options below on mainnet and logs a WARN listing them |
 | `LUNAZ_ALLOW_MOCK_ON_MAINNET` | unset | `1` allows the mock off-ramp on mainnet without `LUNAZ_DEV` |
@@ -110,15 +111,15 @@ JSON; errors are `{"error": ...}`. Session token: `Authorization: Bearer <token>
 
 - Request bodies: at most 64 KiB, larger -> 413.
 - HTTP requests time out after 15 s -> 503 `request timed out`. The invoice WebSocket has no request timeout (see its own limits).
-- Rate limits (429 with the usual JSON error): `POST /v1/invoices` 60 per minute per API key (on top of the monthly plan quota), CSV export 5 per minute per merchant, `POST /v1/account/withdrawals` 10 per hour per merchant, plus the per-endpoint limits listed below.
-- Input sizes: account name and API key name 1-80 characters, viewing key at most 2048 characters, webhook URL at most 2048, email at most 254, swap `refund_to` 1-128. List `limit` parameters are clamped to 1..200 (default 50); billing history returns at most 200 rows.
-- Every response has `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`. Everything except `GET`/`HEAD` on `/healthz`, `/v1/plans` and `/v1/swap/assets` also has `Cache-Control: no-store`.
+- Rate limits (429 with the usual JSON error): `POST /v1/invoices` 60 per minute per API key, CSV export 5 per minute per merchant, `POST /v1/account/withdrawals` 10 per hour per merchant, plus the per-endpoint limits listed below.
+- Input sizes: account name and API key name 1-80 characters, viewing key at most 2048 characters, webhook URL at most 2048, email at most 254, swap `refund_to` 1-128. List `limit` parameters are clamped to 1..200 (default 50).
+- Every response has `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`. Everything except `GET`/`HEAD` on `/healthz`, `/v1/pricing` and `/v1/swap/assets` also has `Cache-Control: no-store`.
 
 ### Auth
 
 Sign-in is delegated to an identity provider (Magic, magic.link; email only). The browser logs in with an email OTP and gets a DID token; the landing server verifies it with `@magic-sdk/admin` and calls the exchange endpoint. core-service never sees provider tokens.
 
-- `POST /v1/auth/exchange` `{email}` with `Authorization: Bearer <LUNAZ_INTERNAL_TOKEN>` -> `{token, new_account, merchant_id}`. The email is trimmed and lowercased; the merchant is found or created (free plan, empty name). 401 on a wrong internal token, 503 `internal auth not configured` if the env is unset, 429 after 20 per email per 15 min.
+- `POST /v1/auth/exchange` `{email}` with `Authorization: Bearer <LUNAZ_INTERNAL_TOKEN>` -> `{token, new_account, merchant_id}`. The email is trimmed and lowercased; the merchant is found or created (empty name). 401 on a wrong internal token, 503 `internal auth not configured` if the env is unset, 429 after 20 per email per 15 min.
 - `POST /v1/auth/signup` and `POST /v1/auth/login` -> 410 (password sign-in was removed). Existing accounts sign in by email.
 - `POST /v1/auth/logout` -> 204
 
@@ -126,16 +127,16 @@ Sign-in is delegated to an identity provider (Magic, magic.link; email only). Th
 
 ### Account (session auth)
 
-- `GET /v1/account` -> `{id, email, name, network, viewing_key_set, ufvk_set, webhook_url, plan}` (`name` may be empty)
+- `GET /v1/account` -> `{id, email, name, network, viewing_key_set, ufvk_set, webhook_url}` (`name` may be empty)
 - `PUT /v1/account` `{name}` (1-80 chars) -> 204
 - `PUT /v1/account/viewing-key` `{viewing_key}` -> 204; set once (at most 2048 chars), 409 if already set or used by another account (`viewing key is already used by another account`). Duplicates are detected by wallet, not by string: `merchants.orchard_ivk_hash` (SHA-256 of the Orchard incoming viewing key bytes) is UNIQUE, so the same wallet re-encoded (e.g. an Orchard-only UIVK) is refused too. Accepts a UIVK (`uivk...`) or a UFVK (`uview...`); a UFVK is reduced to its UIVK and only the UIVK is stored. `PUT /v1/account/ufvk` is the legacy alias and also accepts `{ufvk}`.
 - `GET /v1/account/api-keys`; `POST` `{name}` (1-80 chars) -> 201 `{id, name, prefix, key}` (key shown once); `DELETE /v1/account/api-keys/{id}` -> 204 (revoke)
-- `GET /v1/account/invoices?limit=50` (max 200) -> `[{id, status, amount_zat, received_zat, pending_zat, overpaid_zat, address, txid, created_at, expires_at, paid_at}]`
+- `GET /v1/account/invoices?limit=50` (max 200) -> `[{id, status, amount_zat, fee_zat, received_zat, pending_zat, overpaid_zat, address, txid, created_at, expires_at, paid_at}]`
 
 ### Invoices
 
-- `POST /v1/invoices` (API key; 400 until a viewing key is set) `{amount_zat, expires_in_secs?=900}`. `expires_in_secs` is clamped to 60..86400, `amount_zat` must be 1..21e14. -> `{id, address, amount_zat, zip321_uri, status, expires_at}`
-- `GET /v1/invoices/{id}` (public) -> `{status, amount_zat, received_zat, pending_zat, overpaid_zat, txid, expires_at, swap}`; `swap` is null or `{status, symbol, blockchain, deposit_address, amount_in_formatted, deadline}`
+- `POST /v1/invoices` (API key; 400 until a viewing key is set) `{amount_zat, expires_in_secs?=900}`. `expires_in_secs` is clamped to 60..86400, `amount_zat` must be 1..21e14. -> `{id, address, amount_zat, fee_zat, zip321_uri, status, expires_at}`; `fee_zat` is the Lunaz fee carried as a second payment in `zip321_uri` (see Fees)
+- `GET /v1/invoices/{id}` (public) -> `{status, amount_zat, fee_zat, received_zat, pending_zat, overpaid_zat, txid, expires_at, swap}`; `swap` is null or `{status, symbol, blockchain, deposit_address, amount_in_formatted, deadline}`
 - `GET /v1/invoices/{id}/ws` WebSocket: `{"status":...}` now and on each change, plus `"swap_status"` (1Click status) when a swap exists. Closes on paid, underpaid or expired, and after 1 h at most. The server sends a Ping every 30 s and drops the socket when the client goes away. Limits: 5 sockets per invoice and `LUNAZ_MAX_WS` (default 2000) in total; over a limit the upgrade is refused with 429.
 
 Statuses: `pending` -> `detected` (seen in mempool or mined) -> `paid` (mined sum >= amount) | `underpaid` | `expired`.
@@ -151,7 +152,7 @@ Statuses: `pending` -> `detected` (seen in mempool or mined) -> `paid` (mined su
 - `GET /v1/swap/assets` (public) -> `[{asset_id, symbol, blockchain, decimals, price_usd}]`: USDC/USDT/SOL/ETH/BTC/wNEAR on the main chains, cached 5 min.
 - `POST /v1/invoices/{id}/swap` (public) `{asset_id, refund_to}` -> 201 `{swap_id, deposit_address, deposit_memo, amount_in, amount_in_formatted, amount_in_usd, symbol, blockchain, deadline, time_estimate}`. 409 unless the invoice is pending; 429 after 5 requests per invoice per 10 min; 400 for an unknown asset, a `refund_to` over 128 chars, or a quote 1Click rejects. 1Click rejections are mapped to fixed messages (`refund address is not valid for this asset`, `amount is too small to swap with this asset`, `swap quote rejected, try another asset or pay in ZEC`); the raw message is logged only, with the refund address masked.
 - The quote is EXACT_OUTPUT for the invoice amount; 1Click's fee is added to `amount_in`. Minimum invoice for a swap is about 100000 zat.
-- Deadline = min(invoice expiry, now+30 min). If the invoice expires within 10 min, `expires_at` is extended to now+30 min so the swap can finish. This happens at most once per invoice (`invoices.extended_at`) and never past the original expiry + 30 min; after that a swap on an invoice expiring within 10 min gets 409. Billing invoices are never extended: 409, start a new checkout.
+- Deadline = min(invoice expiry, now+30 min). If the invoice expires within 10 min, `expires_at` is extended to now+30 min so the swap can finish. This happens at most once per invoice (`invoices.extended_at`) and never past the original expiry + 30 min; after that a swap on an invoice expiring within 10 min gets 409. Fee settlement invoices are never extended: 409, start a new settlement.
 - One active swap per invoice: a new request replaces the old row only while it is `PENDING_DEPOSIT`, `REFUNDED` or `FAILED`, and the old deposit address is abandoned (do not send to it). Otherwise 409 `a swap is already in progress`. This is checked again atomically after the 1Click quote returns, so a swap that received a deposit meanwhile (or a concurrent request) is never dropped; the unused quote simply expires.
 - The swap may deliver slightly more or less ZEC than the invoice (see over/underpayment above).
 
@@ -167,7 +168,7 @@ Statuses: `pending` -> `detected` (seen in mempool or mined) -> `paid` (mined su
 - Delivery: POST with headers `X-Lunaz-Event-Id: <event id>` (same on every attempt) and `X-Lunaz-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "{t}.{raw body}">`, keyed with the merchant's current webhook secret. `t` is the send time of that attempt, so every attempt is signed again; the body bytes never change. Receivers recompute `v1`, compare in constant time, reject when `|now - t| > 300` s, and de-duplicate by event id.
 - Every body has `id` (the event id) and `created_at` (unix seconds of the event), plus the type's fields.
 - Body always: `{id, created_at, type, invoice_id, status, amount_zat, received_zat, pending_zat, overpaid_zat, txid, swap}` (invoice events; amounts as for `GET /v1/invoices/{id}`). `swap` is `{asset, blockchain, amount_in_formatted, status}` or null.
-- Types: `invoice.paid`, `invoice.underpaid`, `swap.refunded`, `swap.failed`, `swap.incomplete_deposit` (the swap ones leave the invoice `pending`; the buyer can start another swap or pay ZEC), `withdrawal.updated`, `plan.updated` and `test` (`invoice_id: null`).
+- Types: `invoice.paid`, `invoice.underpaid`, `swap.refunded`, `swap.failed`, `swap.incomplete_deposit` (the swap ones leave the invoice `pending`; the buyer can start another swap or pay ZEC), `withdrawal.updated` and `test` (`invoice_id: null`).
 - Events are stored in the database before sending, so pending events survive a restart. A background loop (every 2 s) sends due events concurrently: at most 16 in flight overall and 2 per merchant, so a slow endpoint only delays its own merchant's events. A claimed event is leased for 30 s, so it is never sent twice at once. Statuses: `pending` -> `delivered` (any 2xx) | `failed`.
 - 3 attempts in total: immediately, after 10 s, after 60 s. A non-2xx or network error uses up an attempt (errors are stored in the same coarse form as the test endpoint returns, never raw network errors); after the third the event is `failed` (`next_attempt_at: null`). No webhook URL at send time -> `failed` with `last_error: "no webhook URL configured"`. Events are only created while a URL is set.
 - `POST /v1/account/webhook/test` makes one synchronous attempt (no retries) and stores a `test` event with its final status.
@@ -191,37 +192,27 @@ Mock mode: ZEC/USD is the cached 1Click price, USD -> fiat is `LUNAZ_MOCK_FX` (i
 
 Statuses: `quote` (never stored) -> `awaiting_kyc` -> `awaiting_deposit` -> `deposit_received` -> `converting` -> `payout_processing` -> `completed`; also `expired` (quote or deposit window passed, swept every 10 s), `failed`, `cancelled`. Every change is logged as an event and sent to the merchant webhook as `withdrawal.updated` (`{id, created_at, type, invoice_id: null, withdrawal_id, status, amount_zat, fiat_currency, fiat_amount}`), queued, signed and retried like the invoice events.
 
-### Plans and billing
+### Fees
 
-Note: monthly plans are being replaced by per-payment fees (0.5% inside each shielded payment, 0.25% app fee on cross-chain swaps). The code below describes the current implementation.
+Lunaz charges a per-payment fee and stays non-custodial: the fee is a second payment in the invoice's own ZIP-321 request, sent by the buyer's wallet straight to a Lunaz treasury address. There are no plans or usage limits.
 
-All features are on every plan; only volume is limited. Existing merchants are on `free`.
-
-| Plan | USD / month | Invoices / month | API keys |
-|---|---|---|---|
-| `free` | 0 | 100 | 2 |
-| `pro` | 29 | 5000 | 10 |
-| `platform` | 199 | unlimited | 50 |
-| `enterprise` | contact us | unlimited | unlimited |
-
-- Limits: `POST /v1/invoices` counts invoices created in the current UTC calendar month (billing invoices excluded); `POST /v1/account/api-keys` counts active keys. Over the limit -> 402 `{error, limit, used, plan}`.
-- A plan is effective until `plan_expires_at`; after that the merchant is on `free`. The 10 s sweep resets the stored plan and sends the `plan.updated` webhook `{id, created_at, type, invoice_id: null, plan, expires_at}`.
-- ZEC billing is dogfooded: the treasury (`LUNAZ_BILLING_MERCHANT_ID`) is an ordinary Lunaz merchant with a viewing key. A checkout creates a normal invoice on it (memo `lunaz:billing:<subscription id>`, 30 min), priced `ceil(price_usd * months / zec_usd * 1e8)` zat with the cached 1Click ZEC price (`LUNAZ_MOCK_ZEC_USD` as fallback with the mock off-ramp only; 503 without a price). The invoice is public like any other (`GET /v1/invoices/{id}`, WebSocket).
-- When that invoice turns `paid` the subscription is paid, the plan runs for `months * 30` days from `max(now, current expiry)` if it is the same still-active plan, otherwise from now. Underpaid or expired -> subscription `expired` (a top-up to the full amount still activates it within the grace window).
-- Grace window: the ZEC price is fixed at checkout, so a billing invoice that turns `paid` (full amount mined, as seen by Lunaz) more than 1 h after its `expires_at` does not activate the plan. The invoice itself still turns `paid` on the treasury, but the subscription becomes `late_paid` (`paid_at` set, no period), the plan is unchanged and no `plan.updated` is sent; the treasury refunds or credits it by hand.
-- No proration: switching to another paid plan starts the new plan now and replaces the old one. Renewals are manual payments; nothing is charged automatically.
-- `GET /v1/plans` (public) -> `[{id, name, price_usd, invoices_per_month, api_keys}]`
-- `GET /v1/account/plan` -> `{plan, plan_name, expires_at, limits: {invoices_per_month, api_keys}, usage: {invoices_this_month, api_keys_active}, period_start_of_month, sandbox_billing, billing_configured}`
-- `POST /v1/account/billing/checkout` `{plan, months: 1|3|12}` -> `{subscription_id, plan, months, price_usd, amount_zat, zec_usd, invoice: {id, address, zip321_uri, expires_at, status}}`. 400 for `free`, `enterprise`, unknown plans or the treasury itself.
-- `GET /v1/account/billing` -> newest first `[{id, plan, months, price_usd, amount_zat, zec_usd, invoice_id, status (pending|paid|expired|late_paid|cancelled), invoice_status, created_at, paid_at, period_start, period_end}]`
-- `POST /v1/account/billing/{subscription_id}/simulate-paid` -> `{status: "paid"}`; only with `LUNAZ_BILLING_SANDBOX=1`, 404 otherwise.
-- `GET /v1/account` also returns `plan`.
+- The fee is active only when `LUNAZ_BILLING_MERCHANT_ID` names a treasury merchant that has a viewing key and `LUNAZ_FEE_BPS` > 0. Otherwise invoices have `fee_zat: 0` and a single-payment URI (dev and testnet keep working without a treasury).
+- `fee_zat = max(LUNAZ_FEE_MIN_ZAT, amount_zat * LUNAZ_FEE_BPS / 10000)` (integer math, rounded down). Invoices of the treasury itself (fee settlements) have no fee.
+- The fee address is derived from the treasury viewing key at the treasury's next diversifier index (stored as `invoices.fee_div_index`, `fee_address`). The URI holds two payments: `[0]` merchant address, `amount_zat`, memo `lunaz:<invoice id>`; `[1]` fee address, `fee_zat`, memo `lunaz-fee:<invoice id>`. `address` and `amount_zat` in responses stay the merchant's.
+- The watcher records payments to fee addresses in `fee_payments`. A fee payment never changes the invoice status; a missing fee never blocks `paid`.
+- Outstanding fees per merchant: `charged` = sum of `fee_zat` over its `paid` and `underpaid` invoices; `paid_in_tx` = mined fee payments, capped per invoice at that invoice's `fee_zat` (overpaying one fee does not credit another); `settled` = paid settlements; `outstanding = max(0, charged - paid_in_tx - settled)`. Fees on invoices paid through a cross-chain swap are not paid in the tx and show up as outstanding.
+- Settlement: a normal 1 h invoice on the treasury (memo `lunaz-settle:<settlement id>`). When it turns `paid` or `underpaid` the settlement becomes `paid` and credits the mined amount, capped at the invoice amount (a later top-up raises it). Expired -> settlement `expired`; a late payment still credits it.
+- `GET /v1/pricing` (public) -> `{fee_bps, fee_min_zat, swap_fee_bps}`. `fee_bps` is 0 while the fee is inactive; `swap_fee_bps` is `LUNAZ_APP_FEE_BPS` or 0.
+- `GET /v1/account/fees` -> `{fee_bps, fee_min_zat, charged_zat, paid_in_tx_zat, settled_zat, outstanding_zat, settlements: [{id, invoice_id, amount_zat, status (pending|paid|expired), created_at, paid_at}]}` (newest first, at most 50).
+- `POST /v1/account/fees/settle` -> `{id, amount_zat, invoice: {id, address, amount_zat, zip321_uri, expires_at}}` for the whole outstanding amount. 409 `nothing to settle` when outstanding is 0, 409 `a settlement is already pending` with `{settlement}` while an earlier settlement invoice has not expired, 409 for the treasury itself, 503 `fee settlement not configured` without a treasury (or its viewing key), 429 after 10 per merchant per 15 min.
+- `POST /v1/account/fees/settle/{id}/simulate-paid` -> `{status: "paid"}`; only with `LUNAZ_BILLING_SANDBOX=1`, 404 otherwise.
+- Older databases keep the `subscriptions` table and `merchants.plan` columns; they are no longer used.
 
 ### Export (session auth)
 
 `GET /v1/account/export.csv?from=<unix>&to=<unix>&kind=invoices|payments`. `kind` defaults to `invoices`; the range filters on invoice `created_at` (default all); max 50000 rows. Returns a `text/csv` attachment `lunaz-<kind>-<from>-<to>.csv` with a header row and RFC 4180 quoting. ZEC amounts are exact 8-decimal strings. Text cells starting with `=`, `+`, `-`, `@`, tab or CR (and not a number) get a leading `'` and are quoted, so spreadsheets do not run them as formulas. 429 after 5 exports per merchant per minute. The export runs on a separate read-only connection and does not block other requests.
 
-- `invoices`: `invoice_id, created_at, paid_at, status, amount_zec, received_zec (mined), overpaid_zec, usd_rate, received_usd, txid, paid_with, origin_chain, origin_amount, swap_status`. Dates are ISO 8601 UTC. `usd_rate` (USD per ZEC) is recorded from the 1Click price when the invoice turns paid or underpaid; older invoices have none. `paid_with` is `ZEC` or the swap symbol once the swap succeeded.
+- `invoices`: `invoice_id, created_at, paid_at, status, amount_zec, fee_zec, received_zec (mined), overpaid_zec, usd_rate, received_usd, txid, paid_with, origin_chain, origin_amount, swap_status`. Dates are ISO 8601 UTC. `usd_rate` (USD per ZEC) is recorded from the 1Click price when the invoice turns paid or underpaid; older invoices have none. `paid_with` is `ZEC` or the swap symbol once the swap succeeded.
 - `payments`: `txid, action_index, pool (orchard|ironwood), invoice_id, value_zec, block_height (empty while mempool only), invoice_status`.
 
 ### Other
@@ -231,6 +222,6 @@ All features are on every plan; only volume is limited. Existing merchants are o
 ## Known limitations
 
 - Chain reorgs are not handled.
-- Rate limits (exchange, swaps, invoices per key, export, withdrawals, checkout, webhook tests) are in memory: lost on restart, not shared between instances. Run a single instance.
+- Rate limits (exchange, swaps, invoices per key, export, withdrawals, fee settlements, webhook tests) are in memory: lost on restart, not shared between instances. Run a single instance.
 - Swaps need an invoice of about 0.001 ZEC (100000 zat) or more.
 - The viewing key cannot be changed once set. Databases from older versions are migrated on startup: stored UFVKs are converted to UIVKs in place (invoice addresses stay valid). `orchard_ivk_hash` is backfilled for existing merchants (the count is logged). If two existing accounts already share a wallet, startup continues: a WARN names both merchant ids and the later one keeps a NULL hash until resolved by hand.

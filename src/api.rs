@@ -114,17 +114,37 @@ fn invoice_address(
         .encode(net))
 }
 
-fn zip321_uri(address: &str, amount: u64, memo: &str) -> anyhow::Result<String> {
-    let addr: ZcashAddress = address.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let p = Payment::new(
-        addr,
-        Some(Zatoshis::from_u64(amount)?),
-        Some(MemoBytes::from_bytes(memo.as_bytes())?),
-        None,
-        None,
-        vec![],
-    )?;
-    Ok(TransactionRequest::new(vec![p])?.to_uri())
+/// One ZIP-321 request; each entry is (address, amount, memo).
+fn zip321_uri(pays: &[(&str, u64, &str)]) -> anyhow::Result<String> {
+    let ps = pays
+        .iter()
+        .map(|&(a, z, m)| {
+            let addr: ZcashAddress = a.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(Payment::new(
+                addr,
+                Some(Zatoshis::from_u64(z)?),
+                Some(MemoBytes::from_bytes(m.as_bytes())?),
+                None,
+                None,
+                vec![],
+            )?)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(TransactionRequest::new(ps)?.to_uri())
+}
+
+/// Pays the merchant, plus the Lunaz fee as a second payment when the invoice has one.
+fn invoice_uri(
+    id: &str,
+    address: &str,
+    amount: u64,
+    memo: &str,
+    fee: Option<(&str, u64)>,
+) -> anyhow::Result<String> {
+    let fee_memo = format!("lunaz-fee:{id}");
+    let mut pays = vec![(address, amount, memo)];
+    pays.extend(fee.map(|(a, z)| (a, z, fee_memo.as_str())));
+    zip321_uri(&pays)
 }
 
 #[derive(Deserialize)]
@@ -155,7 +175,6 @@ pub async fn create_invoice(
             "too many invoices for this api key, try again in a minute",
         ));
     }
-    crate::billing::check_invoices(&st, &db, mid)?;
     Ok(Json(new_invoice(&st, &db, mid, b.amount_zat, ttl, None)?))
 }
 
@@ -171,27 +190,50 @@ pub fn new_invoice(
 ) -> Result<Value, AppErr> {
     let id = uuid::Uuid::new_v4().to_string();
     let (created, expires) = (now(), now() + ttl);
-    let (ufvk, idx): (String, u64) = db
-        .query_row(
-            "UPDATE merchants SET next_index=next_index+1 WHERE id=?1 AND ufvk IS NOT NULL RETURNING ufvk, next_index-1",
-            [mid],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?
-        .ok_or_else(|| bad(StatusCode::BAD_REQUEST, "viewing key not set"))?;
+    let (ufvk, idx) =
+        alloc(db, mid)?.ok_or_else(|| bad(StatusCode::BAD_REQUEST, "viewing key not set"))?;
     let address = invoice_address(&st.net, &parse_viewing_key(&st.net, &ufvk)?, idx)?;
-    let uri = zip321_uri(
+    // Fee address on the treasury; none for the treasury's own invoices or without a treasury key.
+    let fee = match st.fee.merchant.filter(|&t| t != mid && st.fee.bps > 0) {
+        Some(t) => alloc(db, t)?,
+        None => None,
+    };
+    let (fee_zat, fee_idx, fee_address) = match fee {
+        Some((k, i)) => (
+            st.fee.fee_zat(amount),
+            Some(i),
+            Some(invoice_address(
+                &st.net,
+                &parse_viewing_key(&st.net, &k)?,
+                i,
+            )?),
+        ),
+        None => (0, None, None),
+    };
+    let uri = invoice_uri(
+        &id,
         &address,
         amount,
         &memo.map_or(format!("lunaz:{id}"), String::from),
+        fee_address.as_deref().map(|a| (a, fee_zat)),
     )?;
     db.execute(
-        "INSERT INTO invoices(id,merchant_id,div_index,address,amount_zat,status,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,'pending',?6,?7)",
-        params![id, mid, idx, address, amount, created, expires],
+        "INSERT INTO invoices(id,merchant_id,div_index,address,amount_zat,status,created_at,expires_at,fee_zat,fee_div_index,fee_address) VALUES(?1,?2,?3,?4,?5,'pending',?6,?7,?8,?9,?10)",
+        params![id, mid, idx, address, amount, created, expires, fee_zat, fee_idx, fee_address],
     )?;
     Ok(
-        json!({"id": id, "address": address, "amount_zat": amount, "zip321_uri": uri, "status": "pending", "expires_at": expires}),
+        json!({"id": id, "address": address, "amount_zat": amount, "fee_zat": fee_zat, "zip321_uri": uri, "status": "pending", "expires_at": expires}),
     )
+}
+
+/// Next diversifier index and viewing key of a merchant; None without a viewing key.
+fn alloc(db: &rusqlite::Connection, mid: i64) -> rusqlite::Result<Option<(String, u64)>> {
+    db.query_row(
+        "UPDATE merchants SET next_index=next_index+1 WHERE id=?1 AND ufvk IS NOT NULL RETURNING ufvk, next_index-1",
+        [mid],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
 }
 
 fn status_of(st: &St, id: &str) -> rusqlite::Result<Option<String>> {
@@ -208,15 +250,16 @@ pub async fn get_invoice(State(st): State<Arc<St>>, Path(id): Path<String>) -> R
     let mut v = db
         .query_row(
             "SELECT status, amount_zat, expires_at, txid, (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id AND height IS NOT NULL), address,
-             (SELECT 'lunaz:billing:' || id FROM subscriptions WHERE invoice_id=invoices.id),
-             (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id AND height IS NULL)
+             (SELECT 'lunaz-settle:' || id FROM fee_settlements WHERE invoice_id=invoices.id),
+             (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id AND height IS NULL), fee_zat, fee_address
              FROM invoices WHERE id=?1",
             [&id],
             |r| {
                 let (amount, address) = (r.get::<_, i64>(1)?, r.get::<_, String>(5)?);
                 let memo = r.get::<_, Option<String>>(6)?.unwrap_or(format!("lunaz:{id}"));
-                let uri = zip321_uri(&address, amount as u64, &memo).ok();
-                Ok(json!({"id": id, "status": r.get::<_, String>(0)?, "amount_zat": amount, "address": address, "zip321_uri": uri,
+                let (fee, fee_address) = (r.get::<_, i64>(8)?, r.get::<_, Option<String>>(9)?);
+                let uri = invoice_uri(&id, &address, amount as u64, &memo, fee_address.as_deref().map(|a| (a, fee as u64))).ok();
+                Ok(json!({"id": id, "status": r.get::<_, String>(0)?, "amount_zat": amount, "fee_zat": fee, "address": address, "zip321_uri": uri,
                     "expires_at": r.get::<_, i64>(2)?, "txid": r.get::<_, Option<String>>(3)?, "received_zat": r.get::<_, i64>(4)?, "pending_zat": r.get::<_, i64>(7)?, "overpaid_zat": (r.get::<_, i64>(4)? - amount).max(0)}))
             },
         )
@@ -366,7 +409,7 @@ mod tests {
                 .unwrap()
                 .encode(&net)
         );
-        assert!(zip321_uri(&addr, 1000, "lunaz:x")
+        assert!(zip321_uri(&[(&addr, 1000, "lunaz:x")])
             .unwrap()
             .starts_with("zcash:utest"));
     }

@@ -133,13 +133,13 @@ pub fn app_fee(
 
 const SWAP_SECS: i64 = 1800;
 
-/// (invoice expiry, swap deadline). An invoice too close to expiry is extended once, never past its original expiry + 30 min; billing invoices never.
+/// (invoice expiry, swap deadline). An invoice too close to expiry is extended once, never past its original expiry + 30 min; fee settlement invoices never.
 fn window(expires: i64, extended: bool, billing: bool, t: i64) -> Result<(i64, i64), &'static str> {
     if expires >= t + 600 {
         return Ok((expires, expires.min(t + SWAP_SECS)));
     }
     if billing {
-        return Err("billing invoice expires too soon for a swap; start a new checkout");
+        return Err("settlement invoice expires too soon for a swap; start a new settlement");
     }
     if extended {
         return Err("invoice expires too soon for a swap; pay in ZEC");
@@ -219,15 +219,15 @@ pub async fn create_swap(
     Path(id): Path<String>,
     Json(b): Json<NewSwap>,
 ) -> Result<(StatusCode, Json<Value>), AppErr> {
-    type Inv = (String, i64, String, i64, bool, bool);
-    let (status, amount, address, expires, extended, billing): Inv = st
+    type Inv = (String, i64, String, i64, bool, bool, i64);
+    let (status, amount, address, expires, extended, billing, fee_zat): Inv = st
         .db
         .lk()
         .query_row(
             "SELECT status, amount_zat, address, expires_at, extended_at IS NOT NULL,
-             EXISTS(SELECT 1 FROM subscriptions WHERE invoice_id=invoices.id) FROM invoices WHERE id=?1",
+             EXISTS(SELECT 1 FROM fee_settlements WHERE invoice_id=invoices.id), fee_zat FROM invoices WHERE id=?1",
             [&id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
         )
         .optional()?
         .ok_or_else(|| bad(StatusCode::NOT_FOUND, "no such invoice"))?;
@@ -269,9 +269,14 @@ pub async fn create_swap(
     let mut body = json!({"dry": false, "swapType": "EXACT_OUTPUT", "slippageTolerance": 100, "originAsset": b.asset_id, "depositType": "ORIGIN_CHAIN",
         "destinationAsset": ZEC, "amount": amount.to_string(), "recipient": address, "recipientType": "DESTINATION_CHAIN",
         "refundTo": refund, "refundType": "ORIGIN_CHAIN", "deadline": iso(deadline)});
+    // The swap delivers only the merchant amount, so the Lunaz fee rides on the app fee instead of a second output.
+    let mut lunaz_bps = 0;
     if let Some((recipient, fee)) = &st.app_fee {
+        if fee_zat > 0 {
+            lunaz_bps = st.fee.bps;
+        }
         // EXACT_OUTPUT: the fee is added to amountIn, so the buyer pays it and the invoice still gets its amount.
-        body["appFees"] = json!([{"recipient": recipient, "fee": fee}]);
+        body["appFees"] = json!([{"recipient": recipient, "fee": fee + lunaz_bps}]);
     }
     let r = call(&st, st.http.post(format!("{API}/quote")))
         .json(&body)
@@ -300,9 +305,9 @@ pub async fn create_swap(
     let sid = uuid::Uuid::new_v4().to_string();
     let conflict = commit(&st.db.lk(), &id, t, new_exp, |db| {
         db.execute(
-            "INSERT INTO swaps(id,invoice_id,origin_asset,symbol,blockchain,deposit_address,deposit_memo,amount_in,amount_in_formatted,amount_in_usd,refund_to,deadline,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)",
-            params![sid, id, b.asset_id, a["symbol"].as_str(), a["blockchain"].as_str(), dep, s("depositMemo"), s("amountIn"), s("amountInFormatted"), s("amountInUsd"), refund, iso(deadline), t],
+            "INSERT INTO swaps(id,invoice_id,origin_asset,symbol,blockchain,deposit_address,deposit_memo,amount_in,amount_in_formatted,amount_in_usd,refund_to,deadline,created_at,updated_at,lunaz_fee_bps)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13,?14)",
+            params![sid, id, b.asset_id, a["symbol"].as_str(), a["blockchain"].as_str(), dep, s("depositMemo"), s("amountIn"), s("amountInFormatted"), s("amountInUsd"), refund, iso(deadline), t, lunaz_bps],
         )
     })?;
     if let Some(m) = conflict {

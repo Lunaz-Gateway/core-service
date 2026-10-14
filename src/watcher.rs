@@ -70,7 +70,6 @@ pub async fn scanner(st: Arc<St>) {
 fn expire(st: &Arc<St>) {
     sweep(st);
     crate::offramp::expire(st);
-    crate::billing::sweep(st);
     crate::hook::purge(&st.db.lk());
     let _ = st
         .db
@@ -85,7 +84,7 @@ fn expire(st: &Arc<St>) {
     })()
     .unwrap_or_default();
     for id in ids {
-        let _ = crate::billing::on_invoice(st, &st.db.lk(), &id, "expired");
+        let _ = crate::fees::on_invoice(&st.db.lk(), &id, "expired");
         let _ = st.events.send((id, "expired".into()));
     }
 }
@@ -96,6 +95,10 @@ fn sweep(st: &Arc<St>) {
     // An unmined payment not mined within the hour was most likely dropped.
     let _ = db.execute(
         "DELETE FROM payments WHERE height IS NULL AND COALESCE(seen_at,0)<?1",
+        [now() - DROPPED_AFTER],
+    );
+    let _ = db.execute(
+        "DELETE FROM fee_payments WHERE height IS NULL AND seen_at<?1",
         [now() - DROPPED_AFTER],
     );
     let ids: Vec<String> = db
@@ -271,6 +274,9 @@ fn record(
         )
         .optional()?
     else {
+        if st.fee.merchant == Some(merchant) {
+            record_fee(&db, div, txid, idx, value, height)?;
+        }
         return Ok(());
     };
     if height.is_none() && is_final(&status) {
@@ -282,6 +288,34 @@ fn record(
         params![txid, idx, id, value, height, now()],
     )?;
     transition(st, &db, &id, Some(txid))
+}
+
+/// A payment to an invoice's fee address on the treasury; never changes the invoice status.
+// ponytail: fee_div_index is matched without the treasury id, so changing LUNAZ_BILLING_MERCHANT_ID can mismatch old fee addresses
+fn record_fee(
+    db: &Connection,
+    div: i64,
+    txid: &str,
+    idx: usize,
+    value: u64,
+    height: Option<u64>,
+) -> Result<()> {
+    let Some(id) = db
+        .query_row(
+            "SELECT id FROM invoices WHERE fee_div_index=?1",
+            [div],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    else {
+        return Ok(());
+    };
+    db.execute(
+        "INSERT INTO fee_payments(txid,action_idx,invoice_id,value_zat,height,seen_at) VALUES(?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(txid,action_idx) DO UPDATE SET height=COALESCE(excluded.height, height)",
+        params![txid, idx, id, value, height, now()],
+    )?;
+    Ok(())
 }
 
 /// Next invoice status given what was received (mempool + mined) and mined only; None = unchanged.
@@ -351,7 +385,7 @@ fn transition(st: &Arc<St>, db: &Connection, id: &str, txid: Option<&str>) -> Re
     if let Some(t) = hook_type(new) {
         crate::hook::notify(st, db, id, t)?;
     }
-    crate::billing::on_invoice(st, db, id, new)?;
+    crate::fees::on_invoice(db, id, new)?;
     Ok(())
 }
 
@@ -561,6 +595,85 @@ mod tests {
         record(&st, 1, D, "t1", 0, 100_000, Some(3)).unwrap();
         assert_eq!(status(&st), "paid");
         assert_eq!(amounts(&st).await, (100_000, 0, 0));
+    }
+
+    // Merchant 2 invoices carry a fee to treasury 1; fee payments never touch the invoice status.
+    #[tokio::test]
+    async fn fee_payments_and_outstanding() {
+        use zcash_keys::keys::UnifiedSpendingKey;
+        let mut st = Arc::into_inner(crate::tests::test_st()).unwrap();
+        st.fee.merchant = Some(1);
+        let st = Arc::new(st);
+        let net = st.net;
+        let db = st.db.lk();
+        for (id, seed) in [(1, 1u8), (2, 2u8)] {
+            let k = UnifiedSpendingKey::from_seed(&net, &[seed; 32], zip32::AccountId::ZERO)
+                .unwrap()
+                .to_unified_full_viewing_key()
+                .to_unified_incoming_viewing_key()
+                .encode(&net)
+                .unwrap();
+            db.execute("INSERT INTO merchants(id,email,password_hash,name,ufvk,webhook_secret) VALUES(?1,?2,'','',?3,'s')", params![id, format!("{id}@b.co"), k]).unwrap();
+        }
+        let inv = |m, amount| {
+            crate::api::new_invoice(&st, &db, m, amount, 900, None)
+                .ok()
+                .unwrap()
+        };
+        let (a, b) = (inv(2, 10_000_000), inv(2, 100_000));
+        assert_eq!(
+            (a["fee_zat"].as_i64(), b["fee_zat"].as_i64()),
+            (Some(50_000), Some(1000))
+        );
+        assert!(a["zip321_uri"].as_str().unwrap().contains("address.1="));
+        assert_eq!(inv(1, 5000)["fee_zat"], 0); // treasury invoice: no fee
+        drop(db);
+        let fee_div = |id: &serde_json::Value| -> u128 {
+            let i: i64 = st
+                .db
+                .lk()
+                .query_row(
+                    "SELECT fee_div_index FROM invoices WHERE id=?1",
+                    [id.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            D + i as u128
+        };
+        let owed = || crate::fees::owed(&st.db.lk(), 2).unwrap();
+        // fee paid in the same tx (overpaid on a), merchant paid on a and b
+        record(&st, 1, fee_div(&a["id"]), "t1", 1, 60_000, Some(5)).unwrap();
+        assert_eq!(owed(), (0, 0, 0, 0)); // nothing charged until paid
+        record(&st, 2, D, "t1", 0, 10_000_000, Some(5)).unwrap();
+        record(&st, 2, D + 1, "t2", 0, 100_000, Some(5)).unwrap();
+        record(&st, 1, fee_div(&b["id"]), "t3", 0, 400, None).unwrap(); // mempool only
+        let paid: i64 = st
+            .db
+            .lk()
+            .query_row(
+                "SELECT COUNT(*) FROM invoices WHERE merchant_id=2 AND status='paid'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(paid, 2);
+        assert_eq!(owed(), (51_000, 50_000, 0, 1000)); // a's extra 10k does not cover b
+                                                       // a swap that carried the Lunaz fee in its app fee waives b's in-tx fee
+        let swap = |q: &str| st.db.lk().execute(q, [b["id"].as_str()]).unwrap();
+        swap("INSERT INTO swaps(id,invoice_id,origin_asset,symbol,blockchain,deposit_address,amount_in,amount_in_formatted,refund_to,deadline,status,created_at,updated_at,lunaz_fee_bps)
+              VALUES('sw',?1,'x','X','x','d','1','1','r','',  'SUCCESS',0,0,50)");
+        assert_eq!(owed(), (50_000, 50_000, 0, 0));
+        swap("DELETE FROM swaps WHERE invoice_id=?1");
+        // settlement: underpaid credits what was mined, a top-up raises it
+        {
+            let db = st.db.lk();
+            db.execute("INSERT INTO invoices(id,merchant_id,div_index,address,amount_zat,status,created_at,expires_at) VALUES('s',1,99,'a',1000,'pending',0,?1)", [now() - 1]).unwrap();
+            db.execute("INSERT INTO fee_settlements(id,merchant_id,invoice_id,amount_zat,status,created_at) VALUES('fs',2,'s',1000,'pending',0)", []).unwrap();
+        }
+        record(&st, 1, D + 99, "t4", 0, 600, Some(6)).unwrap();
+        assert_eq!(owed(), (51_000, 50_000, 600, 400));
+        record(&st, 1, D + 99, "t5", 0, 700, Some(7)).unwrap();
+        assert_eq!(owed(), (51_000, 50_000, 1000, 0));
     }
 
     #[tokio::test]
