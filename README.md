@@ -29,6 +29,8 @@ Non-custodial shielded Zcash payment gateway. Merchants sign up, register a Unif
 | `LUNAZ_DB` | `lunaz.db` (Docker image: `/data/lunaz.db`) | SQLite path |
 | `LUNAZ_BIND` | `127.0.0.1:8080` (Docker image: `0.0.0.0:8080`) | listen address |
 | `LUNAZ_ONECLICK_JWT` | unset | 1Click token; without it 1Click adds a 0.25% fee |
+| `LUNAZ_APP_FEE_RECIPIENT` | unset | NEAR account that receives the cross-chain app fee (1Click `appFees`); set together with `LUNAZ_APP_FEE_BPS` |
+| `LUNAZ_APP_FEE_BPS` | unset | app fee in basis points, 0-1000 (50 = 0.5%); the buyer pays it on top of the swap, the invoice still receives its full amount |
 | `LUNAZ_OFFRAMP` | `mock` | off-ramp provider: `mock` or `transfi` (not implemented yet: off-ramp requests return 501) |
 | `LUNAZ_MOCK_FX` | `{"IDR":16400,"USD":1}` | mock only: USD -> fiat rates (indicative), also defines the supported currencies |
 | `LUNAZ_MOCK_ZEC_USD` | unset | mock off-ramp only (ignored otherwise): fixed ZEC/USD price instead of the 1Click price, also the billing fallback price |

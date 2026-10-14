@@ -111,6 +111,26 @@ pub fn iso(t: i64) -> String {
     )
 }
 
+/// Parses LUNAZ_APP_FEE_RECIPIENT and LUNAZ_APP_FEE_BPS; both unset or empty disables the fee.
+pub fn app_fee(
+    recipient: Option<String>,
+    bps: Option<String>,
+) -> anyhow::Result<Option<(String, u32)>> {
+    let recipient = recipient
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty());
+    let bps = bps.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+    match (recipient, bps) {
+        (None, None) => Ok(None),
+        (Some(r), Some(b)) => match b.parse::<u32>() {
+            Ok(0) => Ok(None),
+            Ok(f) if f <= 1000 => Ok(Some((r, f))),
+            _ => anyhow::bail!("LUNAZ_APP_FEE_BPS must be 0-1000 basis points, got {b}"),
+        },
+        _ => anyhow::bail!("set both LUNAZ_APP_FEE_RECIPIENT and LUNAZ_APP_FEE_BPS, or neither"),
+    }
+}
+
 const SWAP_SECS: i64 = 1800;
 
 /// (invoice expiry, swap deadline). An invoice too close to expiry is extended once, never past its original expiry + 30 min; billing invoices never.
@@ -246,9 +266,13 @@ pub async fn create_swap(
         .find(|a| a["asset_id"] == b.asset_id)
         .ok_or_else(|| bad(StatusCode::BAD_REQUEST, "unsupported asset_id"))?;
     // Invoice amount is the exact 1Click output: withdrawFee is added to amountIn, not deducted from amountOut.
-    let body = json!({"dry": false, "swapType": "EXACT_OUTPUT", "slippageTolerance": 100, "originAsset": b.asset_id, "depositType": "ORIGIN_CHAIN",
+    let mut body = json!({"dry": false, "swapType": "EXACT_OUTPUT", "slippageTolerance": 100, "originAsset": b.asset_id, "depositType": "ORIGIN_CHAIN",
         "destinationAsset": ZEC, "amount": amount.to_string(), "recipient": address, "recipientType": "DESTINATION_CHAIN",
         "refundTo": refund, "refundType": "ORIGIN_CHAIN", "deadline": iso(deadline)});
+    if let Some((recipient, fee)) = &st.app_fee {
+        // EXACT_OUTPUT: the fee is added to amountIn, so the buyer pays it and the invoice still gets its amount.
+        body["appFees"] = json!([{"recipient": recipient, "fee": fee}]);
+    }
     let r = call(&st, st.http.post(format!("{API}/quote")))
         .json(&body)
         .send()
@@ -380,6 +404,22 @@ async fn poll_once(st: &Arc<St>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_fee_env() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(app_fee(None, None).unwrap(), None);
+        assert_eq!(app_fee(s(""), s(" ")).unwrap(), None);
+        assert_eq!(app_fee(s("lunaz.near"), s("0")).unwrap(), None);
+        assert_eq!(
+            app_fee(s(" lunaz.near "), s("50")).unwrap(),
+            Some(("lunaz.near".into(), 50))
+        );
+        assert!(app_fee(s("lunaz.near"), s("1001")).is_err());
+        assert!(app_fee(s("lunaz.near"), s("0.5")).is_err());
+        assert!(app_fee(s("lunaz.near"), None).is_err());
+        assert!(app_fee(None, s("50")).is_err());
+    }
 
     #[test]
     fn curated_filter() {

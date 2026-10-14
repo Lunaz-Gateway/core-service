@@ -29,6 +29,8 @@ pub struct St {
     pub events: broadcast::Sender<(String, String)>,
     pub http: reqwest::Client,
     pub jwt: Option<String>,
+    /// 1Click appFees entry (NEAR account, basis points); None charges no app fee.
+    pub app_fee: Option<(String, u32)>,
     pub assets: Mutex<Option<(i64, Vec<serde_json::Value>)>>,
     pub limits: limit::Limiter,
     pub zec_price: Mutex<Option<f64>>,
@@ -357,6 +359,7 @@ async fn main() -> anyhow::Result<()> {
             .timeout(std::time::Duration::from_secs(5))
             .build()?,
         jwt: env("LUNAZ_ONECLICK_JWT").filter(|j| !j.is_empty()),
+        app_fee: swap::app_fee(env("LUNAZ_APP_FEE_RECIPIENT"), env("LUNAZ_APP_FEE_BPS"))?,
         assets: Mutex::new(None),
         limits: Default::default(),
         zec_price: Mutex::new(None),
@@ -437,6 +440,7 @@ pub mod tests {
             events: broadcast::channel(16).0,
             http: reqwest::Client::new(),
             jwt: None,
+            app_fee: None,
             assets: Mutex::new(None),
             limits: Default::default(),
             zec_price: Mutex::new(None),
