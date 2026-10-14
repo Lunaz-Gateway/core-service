@@ -193,6 +193,8 @@ Statuses: `quote` (never stored) -> `awaiting_kyc` -> `awaiting_deposit` -> `dep
 
 ### Plans and billing
 
+Note: monthly plans are being replaced by per-payment fees (0.5% inside each shielded payment, 0.25% app fee on cross-chain swaps). The code below describes the current implementation.
+
 All features are on every plan; only volume is limited. Existing merchants are on `free`.
 
 | Plan | USD / month | Invoices / month | API keys |
