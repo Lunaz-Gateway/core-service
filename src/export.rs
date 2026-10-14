@@ -95,13 +95,13 @@ fn build(path: &str, kind: &str, mid: i64, from: i64, to: i64) -> rusqlite::Resu
     match kind {
         "invoices" => {
             out += &line(
-                &"invoice_id,created_at,paid_at,status,amount_zec,received_zec,overpaid_zec,usd_rate,received_usd,txid,paid_with,origin_chain,origin_amount,swap_status"
+                &"invoice_id,created_at,paid_at,status,amount_zec,fee_zec,received_zec,overpaid_zec,usd_rate,received_usd,txid,paid_with,origin_chain,origin_amount,swap_status"
                     .split(',').map(String::from).collect::<Vec<_>>(),
             );
             let mut stmt = db.prepare(
                 "SELECT i.id, i.created_at, i.paid_at, i.status, i.amount_zat,
                     (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=i.id AND height IS NOT NULL), i.paid_usd_rate, i.txid,
-                    w.symbol, w.blockchain, w.amount_in_formatted, w.status
+                    w.symbol, w.blockchain, w.amount_in_formatted, w.status, i.fee_zat
                  FROM invoices i LEFT JOIN swaps w ON w.invoice_id=i.id
                  WHERE i.merchant_id=?1 AND i.created_at>=?2 AND i.created_at<=?3
                  ORDER BY i.created_at, i.div_index LIMIT ?4",
@@ -130,6 +130,7 @@ fn build(path: &str, kind: &str, mid: i64, from: i64, to: i64) -> rusqlite::Resu
                     r.get::<_, Option<i64>>(2)?.map(iso).unwrap_or_default(),
                     status,
                     zec(amount),
+                    zec(r.get(12)?),
                     zec(recv),
                     zec((recv - amount).max(0)),
                     rate.map(|p| p.to_string()).unwrap_or_default(),

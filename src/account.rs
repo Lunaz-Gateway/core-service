@@ -134,12 +134,10 @@ pub async fn account(State(st): S, h: HeaderMap) -> R {
     } else {
         "test"
     };
-    let db = st.db.lk();
-    let mut v = db.query_row("SELECT id, email, name, ufvk IS NOT NULL, webhook_url FROM merchants WHERE id=?1", [mid], |r| {
+    let v = st.db.lk().query_row("SELECT id, email, name, ufvk IS NOT NULL, webhook_url FROM merchants WHERE id=?1", [mid], |r| {
         Ok(json!({"id": r.get::<_, i64>(0)?, "email": r.get::<_, String>(1)?, "name": r.get::<_, String>(2)?, "network": net,
             "ufvk_set": r.get::<_, bool>(3)?, "viewing_key_set": r.get::<_, bool>(3)?, "webhook_url": r.get::<_, Option<String>>(4)?}))
     })?;
-    v["plan"] = crate::billing::plan_of(&st, &db, mid)?.id.clone().into();
     Ok(Json(v))
 }
 
@@ -210,7 +208,6 @@ pub async fn create_key(
     let key = format!("lz_{}", rand_hex());
     let prefix = &key[..12];
     let db = st.db.lk();
-    crate::billing::check_keys(&st, &db, mid)?;
     db.execute(
         "INSERT INTO api_keys(merchant_id,name,prefix,key_hash,created_at) VALUES(?1,?2,?3,?4,?5)",
         params![mid, b.name.trim(), prefix, sha_hex(&key), now()],
@@ -303,12 +300,12 @@ pub async fn list_invoices(State(st): S, h: HeaderMap, Query(q): Query<Lim>) -> 
     let db = st.db.lk();
     let mut s = db.prepare(
         "SELECT id, status, amount_zat, (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id AND height IS NOT NULL), address, txid, created_at, expires_at, paid_at,
-         (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id AND height IS NULL)
+         (SELECT COALESCE(SUM(value_zat),0) FROM payments WHERE invoice_id=invoices.id AND height IS NULL), fee_zat
          FROM invoices WHERE merchant_id=?1 ORDER BY created_at DESC, div_index DESC LIMIT ?2",
     )?;
     let v = s
         .query_map(params![mid, q.limit.unwrap_or(50).clamp(1, 200)], |r| {
-            Ok(json!({"id": r.get::<_, String>(0)?, "status": r.get::<_, String>(1)?, "amount_zat": r.get::<_, i64>(2)?, "received_zat": r.get::<_, i64>(3)?, "pending_zat": r.get::<_, i64>(9)?, "overpaid_zat": (r.get::<_, i64>(3)? - r.get::<_, i64>(2)?).max(0),
+            Ok(json!({"id": r.get::<_, String>(0)?, "status": r.get::<_, String>(1)?, "amount_zat": r.get::<_, i64>(2)?, "fee_zat": r.get::<_, i64>(10)?, "received_zat": r.get::<_, i64>(3)?, "pending_zat": r.get::<_, i64>(9)?, "overpaid_zat": (r.get::<_, i64>(3)? - r.get::<_, i64>(2)?).max(0),
                 "address": r.get::<_, String>(4)?, "txid": r.get::<_, Option<String>>(5)?, "created_at": r.get::<_, i64>(6)?,
                 "expires_at": r.get::<_, i64>(7)?, "paid_at": r.get::<_, Option<i64>>(8)?}))
         })?
