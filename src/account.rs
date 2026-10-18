@@ -88,8 +88,8 @@ pub async fn exchange(State(st): S, h: HeaderMap, Json(b): Json<Exchange>) -> R 
     let db = st.db.lk();
     // INSERT OR IGNORE keeps create-or-reuse atomic under concurrent exchanges.
     let new = db.execute(
-        "INSERT OR IGNORE INTO merchants(email,password_hash,name,webhook_secret) VALUES(?1,'','',?2)",
-        params![email, rand_hex()],
+        "INSERT OR IGNORE INTO merchants(email,password_hash,name,webhook_secret,created_at) VALUES(?1,'','',?2,?3)",
+        params![email, rand_hex(), now()],
     )? == 1;
     let mid: i64 = db.query_row("SELECT id FROM merchants WHERE email=?1", [&email], |r| {
         r.get(0)

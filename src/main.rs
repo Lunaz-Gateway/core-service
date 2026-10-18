@@ -1,5 +1,6 @@
 mod account;
 mod api;
+mod caps;
 mod export;
 mod fees;
 mod hook;
@@ -36,6 +37,7 @@ pub struct St {
     pub zec_price: Mutex<Option<f64>>,
     pub off: offramp::Cfg,
     pub fee: fees::Cfg,
+    pub caps: caps::Cfg,
     pub internal: Option<String>,
     pub hook: hook::Cfg,
     pub ws: Arc<tokio::sync::Semaphore>,
@@ -108,6 +110,7 @@ pub fn app(st: Arc<St>) -> Router {
         )
         .route("/v1/pricing", get(fees::pricing))
         .route("/v1/account/fees", get(fees::summary))
+        .route("/v1/account/limits", get(caps::get))
         .route("/v1/account/fees/settle", post(fees::settle))
         .route(
             "/v1/account/fees/settle/{id}/simulate-paid",
@@ -233,6 +236,9 @@ fn migrate(db: &Connection, net: &Network) -> rusqlite::Result<()> {
         ("invoices", "fee_div_index", "INTEGER"),
         ("invoices", "fee_address", "TEXT"),
         ("swaps", "lunaz_fee_bps", "INTEGER NOT NULL DEFAULT 0"),
+        // 0 = created before limits existed, counted as an old account
+        ("merchants", "created_at", "INTEGER NOT NULL DEFAULT 0"),
+        ("merchants", "verified", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         let has: bool = db.query_row(
             "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name=?2",
@@ -345,6 +351,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("LUNAZ_WEBHOOK_ALLOW_PRIVATE is on: webhooks may target private and loopback addresses (development only)");
     }
     let (off, fee) = (offramp::Cfg::from_env(env)?, fees::Cfg::from_env(env)?);
+    let caps = caps::Cfg::from_env(env)?;
     let scan_threads = match env("LUNAZ_SCAN_THREADS") {
         None => std::thread::available_parallelism()
             .map_or(1, |c| c.get() / 2)
@@ -392,6 +399,7 @@ async fn main() -> anyhow::Result<()> {
         zec_price: Mutex::new(None),
         off,
         fee,
+        caps,
         internal,
         hook: hook::Cfg::new(allow_private, truthy(env("LUNAZ_WEBHOOK_ALLOW_HTTP")))?,
         ws: Arc::new(tokio::sync::Semaphore::new(
@@ -470,11 +478,13 @@ pub mod tests {
             http: reqwest::Client::new(),
             jwt: None,
             app_fee: None,
-            assets: Mutex::new(None),
+            // never-expiring empty token list: tests make no 1Click calls
+            assets: Mutex::new(Some((i64::MAX, vec![]))),
             limits: Default::default(),
             zec_price: Mutex::new(None),
             off: Default::default(),
             fee: Default::default(),
+            caps: Default::default(),
             internal: Some("t".repeat(32)),
             hook: hook::Cfg::new(true, true).unwrap(),
             ws: Arc::new(tokio::sync::Semaphore::new(2000)),

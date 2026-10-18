@@ -38,6 +38,16 @@ The API reference is in the [documentation](https://lunaz.alwaysbedream.dev/docs
 | `LUNAZ_WEBHOOK_ALLOW_PRIVATE` | unset | development only: `1` allows webhooks to private/loopback addresses, any port, `http` |
 | `LUNAZ_MAX_WS` | `2000` | maximum concurrent invoice WebSockets |
 | `LUNAZ_SCAN_THREADS` | half the CPU cores (at least 1) | threads for trial decryption of blocks and mempool transactions, integer >= 1 (`1` = no extra threads); other values abort startup |
+| `LUNAZ_LIMIT_NEW_XC_INVOICE_USD` | `200` | new accounts: largest cross-chain payment, USD. All `LUNAZ_LIMIT_*` values are whole numbers (others abort startup) and `0` disables that cap. A new account becomes established after `LUNAZ_LIMIT_EST_MIN_AGE_DAYS` days and `LUNAZ_LIMIT_EST_MIN_PAID` paid invoices with no outstanding fee; `merchants.verified=1` (set by hand) and the treasury merchant have no volume caps. Over a cap the API returns 403 `limit_exceeded` |
+| `LUNAZ_LIMIT_NEW_XC_DAY_USD` | `300` | new accounts: cross-chain USD per rolling 24 h |
+| `LUNAZ_LIMIT_NEW_XC_FIRST_USD` | `1000` | new accounts: cross-chain USD in total during the first `LUNAZ_LIMIT_EST_MIN_AGE_DAYS` days |
+| `LUNAZ_LIMIT_NEW_ZEC_DAY_USD` | `1000` | new accounts: shielded invoice USD per rolling 24 h (not enforced while the ZEC price is unavailable) |
+| `LUNAZ_LIMIT_EST_XC_INVOICE_USD` | `1000` | established accounts: largest cross-chain payment, USD |
+| `LUNAZ_LIMIT_EST_XC_DAY_USD` | `3000` | established accounts: cross-chain USD per rolling 24 h |
+| `LUNAZ_LIMIT_EST_XC_MONTH_USD` | `20000` | established accounts: cross-chain USD per rolling 30 days |
+| `LUNAZ_LIMIT_INVOICES_DAY` | `500` | all accounts: invoices created per rolling 24 h |
+| `LUNAZ_LIMIT_EST_MIN_AGE_DAYS` | `14` | account age in days to become established |
+| `LUNAZ_LIMIT_EST_MIN_PAID` | `10` | paid invoices to become established |
 | `RUST_LOG` | tracing default | log filter |
 
 Mainnet guards: with `LUNAZ_NETWORK=main` the service refuses to start when `LUNAZ_BILLING_SANDBOX` is on, when the off-ramp is `mock` (the default) without `LUNAZ_ALLOW_MOCK_ON_MAINNET=1`, or when `LUNAZ_WEBHOOK_ALLOW_PRIVATE` is on, unless `LUNAZ_DEV=1` is set. Boolean variables accept `1`, `true`, `yes` or `on`.

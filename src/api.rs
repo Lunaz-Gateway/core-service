@@ -163,18 +163,28 @@ pub async fn create_invoice(
         return Err(bad(StatusCode::BAD_REQUEST, "invalid amount_zat"));
     }
     let ttl = b.expires_in_secs.unwrap_or(900).clamp(60, 86400);
-    let db = st.db.lk();
     let kh = sha_hex(key);
-    let mid: i64 = db
-        .query_row("UPDATE api_keys SET last_used_at=?1 WHERE key_hash=?2 AND revoked_at IS NULL RETURNING merchant_id", params![now(), kh], |r| r.get(0))
-        .optional()?
-        .ok_or_else(|| bad(StatusCode::UNAUTHORIZED, "bad api key"))?;
-    if !st.limits.hit(&format!("inv:{kh}"), 60, 60, now()) {
-        return Err(bad(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many invoices for this api key, try again in a minute",
-        ));
-    }
+    let (mid, want_price) = {
+        let db = st.db.lk();
+        let mid: i64 = db
+            .query_row("UPDATE api_keys SET last_used_at=?1 WHERE key_hash=?2 AND revoked_at IS NULL RETURNING merchant_id", params![now(), kh], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| bad(StatusCode::UNAUTHORIZED, "bad api key"))?;
+        if !st.limits.hit(&format!("inv:{kh}"), 60, 60, now()) {
+            return Err(bad(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many invoices for this api key, try again in a minute",
+            ));
+        }
+        (mid, crate::caps::wants_price(&st, &db, mid, now())?)
+    };
+    // A price outage must not block shielded payments: without a price only the count cap applies.
+    let price = match want_price {
+        true => crate::swap::zec_price(&st).await,
+        false => None,
+    };
+    let db = st.db.lk();
+    crate::caps::check_invoice(&st, &db, mid, b.amount_zat as i64, price, now())?;
     Ok(Json(new_invoice(&st, &db, mid, b.amount_zat, ttl, None)?))
 }
 

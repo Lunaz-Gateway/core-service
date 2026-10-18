@@ -219,15 +219,15 @@ pub async fn create_swap(
     Path(id): Path<String>,
     Json(b): Json<NewSwap>,
 ) -> Result<(StatusCode, Json<Value>), AppErr> {
-    type Inv = (String, i64, String, i64, bool, bool, i64);
-    let (status, amount, address, expires, extended, billing, fee_zat): Inv = st
+    type Inv = (String, i64, String, i64, bool, bool, i64, i64);
+    let (status, amount, address, expires, extended, billing, fee_zat, mid): Inv = st
         .db
         .lk()
         .query_row(
             "SELECT status, amount_zat, address, expires_at, extended_at IS NOT NULL,
-             EXISTS(SELECT 1 FROM fee_settlements WHERE invoice_id=invoices.id), fee_zat FROM invoices WHERE id=?1",
+             EXISTS(SELECT 1 FROM fee_settlements WHERE invoice_id=invoices.id), fee_zat, merchant_id FROM invoices WHERE id=?1",
             [&id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
         )
         .optional()?
         .ok_or_else(|| bad(StatusCode::NOT_FOUND, "no such invoice"))?;
@@ -257,6 +257,10 @@ pub async fn create_swap(
             "refund_to must be 1-128 characters",
         ));
     }
+    let price = zec_price(&st)
+        .await
+        .ok_or_else(|| bad(StatusCode::SERVICE_UNAVAILABLE, "zec price unavailable"))?;
+    crate::caps::check_swap(&st, &st.db.lk(), mid, &id, amount, price, t)?;
     let list = assets(&st).await.map_err(|e| {
         tracing::warn!("tokens: {e:#}");
         bad(StatusCode::BAD_GATEWAY, "swap provider unavailable")
