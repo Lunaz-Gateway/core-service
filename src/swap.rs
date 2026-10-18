@@ -40,13 +40,81 @@ pub fn curate(tokens: &Value) -> Vec<Value> {
         .into_iter()
         .flatten()
         .filter(|t| s(t, "assetId").starts_with("nep141:") && WANT.contains(&(s(t, "symbol").as_str(), s(t, "blockchain").as_str())))
-        .map(|t| json!({"asset_id": t["assetId"], "symbol": t["symbol"], "blockchain": t["blockchain"], "decimals": t["decimals"], "price_usd": t["price"]}))
+        .map(|t| json!({"asset_id": t["assetId"], "symbol": t["symbol"], "blockchain": t["blockchain"], "decimals": t["decimals"], "price_usd": t["price"], "contract_address": t["contractAddress"]}))
         .collect();
     out.sort_by_key(|t| {
         WANT.iter()
             .position(|w| w.0 == t["symbol"] && w.1 == t["blockchain"])
     });
     out
+}
+
+/// Exact decimal string for `amount` base units, e.g. ("1500000", 6) -> "1.5".
+fn decimal(amount: &str, decimals: usize) -> Option<String> {
+    if amount.is_empty() || !amount.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let p = format!("{amount:0>width$}", width = decimals + 1);
+    let (int, frac) = p.split_at(p.len() - decimals);
+    let int = int.trim_start_matches('0');
+    let int = if int.is_empty() { "0" } else { int };
+    let frac = frac.trim_end_matches('0');
+    Some(if frac.is_empty() {
+        int.into()
+    } else {
+        format!("{int}.{frac}")
+    })
+}
+
+/// Wallet payment URI (EIP-681, Solana Pay, BIP-21) for a swap deposit; None when the chain has no standard or a memo is needed.
+pub fn deposit_uri(
+    chain: &str,
+    symbol: &str,
+    contract: Option<&str>,
+    deposit: &str,
+    amount: &str,
+    decimals: usize,
+    memo: Option<&str>,
+) -> Option<String> {
+    if memo.is_some_and(|m| !m.is_empty())
+        || !amount.bytes().all(|b| b.is_ascii_digit())
+        || amount.is_empty()
+    {
+        return None;
+    }
+    let contract = contract.filter(|c| !c.is_empty());
+    let native = matches!(
+        (symbol, chain),
+        ("ETH", "eth" | "base" | "arb") | ("SOL", "sol") | ("BTC", "btc")
+    );
+    if !native && contract.is_none() {
+        return None;
+    }
+    match chain {
+        "eth" | "base" | "arb" => {
+            let id = match chain {
+                "eth" => 1,
+                "base" => 8453,
+                _ => 42161,
+            };
+            Some(match contract.filter(|_| !native) {
+                None => format!("ethereum:{deposit}@{id}?value={amount}"),
+                Some(c) => format!("ethereum:{c}@{id}/transfer?address={deposit}&uint256={amount}"),
+            })
+        }
+        "sol" => {
+            let a = decimal(amount, decimals)?;
+            Some(match contract.filter(|_| !native) {
+                None => format!("solana:{deposit}?amount={a}"),
+                Some(m) => format!("solana:{deposit}?amount={a}&spl-token={m}"),
+            })
+        }
+        "btc" if native => Some(format!(
+            "bitcoin:{deposit}?amount={}",
+            decimal(amount, decimals)?
+        )),
+        _ => None,
+    }
 }
 
 fn call(st: &St, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -307,11 +375,22 @@ pub async fn create_swap(
     };
     let s = |k: &str| q[k].as_str().map(String::from);
     let sid = uuid::Uuid::new_v4().to_string();
+    let uri = s("amountIn").and_then(|amt| {
+        deposit_uri(
+            a["blockchain"].as_str()?,
+            a["symbol"].as_str()?,
+            a["contract_address"].as_str(),
+            dep,
+            &amt,
+            a["decimals"].as_u64()? as usize,
+            s("depositMemo").as_deref(),
+        )
+    });
     let conflict = commit(&st.db.lk(), &id, t, new_exp, |db| {
         db.execute(
-            "INSERT INTO swaps(id,invoice_id,origin_asset,symbol,blockchain,deposit_address,deposit_memo,amount_in,amount_in_formatted,amount_in_usd,refund_to,deadline,created_at,updated_at,lunaz_fee_bps)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13,?14)",
-            params![sid, id, b.asset_id, a["symbol"].as_str(), a["blockchain"].as_str(), dep, s("depositMemo"), s("amountIn"), s("amountInFormatted"), s("amountInUsd"), refund, iso(deadline), t, lunaz_bps],
+            "INSERT INTO swaps(id,invoice_id,origin_asset,symbol,blockchain,deposit_address,deposit_memo,amount_in,amount_in_formatted,amount_in_usd,refund_to,deadline,created_at,updated_at,lunaz_fee_bps,deposit_uri)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13,?14,?15)",
+            params![sid, id, b.asset_id, a["symbol"].as_str(), a["blockchain"].as_str(), dep, s("depositMemo"), s("amountIn"), s("amountInFormatted"), s("amountInUsd"), refund, iso(deadline), t, lunaz_bps, uri],
         )
     })?;
     if let Some(m) = conflict {
@@ -322,7 +401,7 @@ pub async fn create_swap(
     Ok((
         StatusCode::CREATED,
         Json(
-            json!({"swap_id": sid, "deposit_address": dep, "deposit_memo": s("depositMemo"), "amount_in": s("amountIn"), "amount_in_formatted": s("amountInFormatted"),
+            json!({"swap_id": sid, "deposit_address": dep, "deposit_memo": s("depositMemo"), "deposit_uri": uri, "amount_in": s("amountIn"), "amount_in_formatted": s("amountInFormatted"),
             "amount_in_usd": s("amountInUsd"), "symbol": a["symbol"], "blockchain": a["blockchain"], "deadline": iso(deadline), "time_estimate": q["timeEstimate"]}),
         ),
     ))
@@ -330,10 +409,11 @@ pub async fn create_swap(
 
 pub fn swap_json(db: &Connection, invoice: &str) -> Option<Value> {
     db.query_row(
-        "SELECT status, symbol, blockchain, deposit_address, amount_in_formatted, deadline FROM swaps WHERE invoice_id=?1",
+        "SELECT status, symbol, blockchain, deposit_address, amount_in_formatted, deadline, deposit_memo, deposit_uri FROM swaps WHERE invoice_id=?1",
         [invoice],
         |r| Ok(json!({"status": r.get::<_, String>(0)?, "symbol": r.get::<_, String>(1)?, "blockchain": r.get::<_, String>(2)?,
-            "deposit_address": r.get::<_, String>(3)?, "amount_in_formatted": r.get::<_, String>(4)?, "deadline": r.get::<_, String>(5)?})),
+            "deposit_address": r.get::<_, String>(3)?, "amount_in_formatted": r.get::<_, String>(4)?, "deadline": r.get::<_, String>(5)?,
+            "deposit_memo": r.get::<_, Option<String>>(6)?, "deposit_uri": r.get::<_, Option<String>>(7)?})),
     )
     .optional()
     .ok()
@@ -428,6 +508,51 @@ mod tests {
         assert!(app_fee(s("lunaz.near"), s("0.5")).is_err());
         assert!(app_fee(s("lunaz.near"), None).is_err());
         assert!(app_fee(None, s("50")).is_err());
+    }
+
+    #[test]
+    fn deposit_uris() {
+        assert_eq!(decimal("1", 9).unwrap(), "0.000000001");
+        assert_eq!(decimal("1500000", 6).unwrap(), "1.5");
+        assert_eq!(decimal("100000000", 8).unwrap(), "1");
+        assert_eq!(decimal("0", 6).unwrap(), "0");
+        assert_eq!(decimal("1234", 0).unwrap(), "1234");
+        assert_eq!(decimal("1e5", 6), None);
+        let u = |ch, sym, c, amt, d, m| deposit_uri(ch, sym, c, "DEP", amt, d, m);
+        assert_eq!(
+            u("eth", "ETH", None, "1000000000000000", 18, None).unwrap(),
+            "ethereum:DEP@1?value=1000000000000000"
+        );
+        assert_eq!(
+            u("arb", "ETH", None, "5", 18, None).unwrap(),
+            "ethereum:DEP@42161?value=5"
+        );
+        assert_eq!(
+            u("base", "USDC", Some("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"), "1500000", 6, None).unwrap(),
+            "ethereum:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913@8453/transfer?address=DEP&uint256=1500000"
+        );
+        assert_eq!(
+            u("sol", "SOL", None, "1", 9, None).unwrap(),
+            "solana:DEP?amount=0.000000001"
+        );
+        assert_eq!(
+            u("sol", "USDT", Some("Es9v"), "2500000", 6, None).unwrap(),
+            "solana:DEP?amount=2.5&spl-token=Es9v"
+        );
+        assert_eq!(
+            u("btc", "BTC", None, "100000000", 8, None).unwrap(),
+            "bitcoin:DEP?amount=1"
+        );
+        assert_eq!(u("near", "wNEAR", Some("wrap.near"), "1", 24, None), None);
+        assert_eq!(u("eth", "USDC", None, "1", 6, None), None);
+        assert_eq!(u("sol", "USDC", Some(""), "1", 6, None), None);
+        assert_eq!(u("eth", "ETH", None, "1", 18, Some("memo")), None);
+        assert_eq!(
+            u("eth", "ETH", None, "1", 18, Some("")).unwrap(),
+            "ethereum:DEP@1?value=1"
+        );
+        assert_eq!(u("doge", "DOGE", None, "1", 8, None), None);
+        assert_eq!(u("eth", "ETH", None, "", 18, None), None);
     }
 
     #[test]

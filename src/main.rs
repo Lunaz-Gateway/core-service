@@ -239,6 +239,7 @@ fn migrate(db: &Connection, net: &Network) -> rusqlite::Result<()> {
         // 0 = created before limits existed, counted as an old account
         ("merchants", "created_at", "INTEGER NOT NULL DEFAULT 0"),
         ("merchants", "verified", "INTEGER NOT NULL DEFAULT 0"),
+        ("swaps", "deposit_uri", "TEXT"),
     ] {
         let has: bool = db.query_row(
             "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name=?2",
